@@ -18,6 +18,19 @@ from config import OUTPUT_DIR
 # tiny / base / small / medium / large-v3
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 
+# Доступные многоязычные модели с ориентиром по размеру скачивания (для UI).
+# Английские (.en) и distil-модели не включены — для русского не подходят.
+WHISPER_MODELS = {
+    "tiny": "tiny (~75 МБ, быстрая, черновая)",
+    "base": "base (~145 МБ)",
+    "small": "small (~500 МБ, баланс)",
+    "medium": "medium (~1.5 ГБ, точнее, медленнее)",
+    "large-v1": "large-v1 (~3 ГБ, устаревшая)",
+    "large-v2": "large-v2 (~3 ГБ, высокая точность)",
+    "large-v3": "large-v3 (~3 ГБ, макс. точность)",
+    "large-v3-turbo": "large-v3-turbo (~1.6 ГБ, почти как v3, но быстрее)",
+}
+
 # Тип вычислений CTranslate2 на CPU. int8 — быстро и экономно по памяти.
 WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
 
@@ -35,8 +48,8 @@ MEDIA_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus", ".flac", ".aac",
 }
 
-# Ленивый синглтон модели.
-_model = None
+# Кеш загруженных моделей: {(имя, compute_type): WhisperModel}.
+_models: dict = {}
 
 
 def is_media_file(file_path: str) -> bool:
@@ -90,26 +103,94 @@ def _save_srt(source_path: Path, segments: list[tuple[float, float, str]]) -> Pa
     return srt_path
 
 
-def _get_model():
-    """Лениво загружает (и кеширует) модель Whisper."""
-    global _model
-    if _model is not None:
-        return _model
+def _get_model(model_name: str | None = None):
+    """
+    Лениво загружает (и кеширует) модель Whisper по имени.
+    При первом обращении к незнакомой модели faster-whisper скачает её.
+    """
+    name = model_name or WHISPER_MODEL
+    key = (name, WHISPER_COMPUTE_TYPE)
+    if key in _models:
+        return _models[key]
 
     from faster_whisper import WhisperModel
 
-    _model = WhisperModel(
-        WHISPER_MODEL,
+    model = WhisperModel(
+        name,
         device="cpu",
         compute_type=WHISPER_COMPUTE_TYPE,
         download_root=WHISPER_DOWNLOAD_ROOT,
     )
-    return _model
+    _models[key] = model
+    return model
 
 
-def transcribe_media(file_path: str) -> tuple[str | None, str]:
+# Файлы модели, которые тянет faster-whisper (те же allow_patterns).
+_MODEL_FILES = [
+    "config.json",
+    "preprocessor_config.json",
+    "model.bin",
+    "tokenizer.json",
+    "vocabulary.*",
+]
+
+
+def _repo_id(model_name: str) -> str:
+    """Имя размера → репозиторий на Hugging Face (или сам id, если это путь)."""
+    from faster_whisper.utils import _MODELS
+    return _MODELS.get(model_name, model_name)
+
+
+def is_model_cached(model_name: str) -> bool:
+    """True, если модель уже скачана локально (в кеше), без обращения к сети."""
+    import huggingface_hub
+    try:
+        huggingface_hub.snapshot_download(
+            _repo_id(model_name),
+            cache_dir=WHISPER_DOWNLOAD_ROOT,
+            allow_patterns=_MODEL_FILES,
+            local_files_only=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def download_model_files(model_name: str) -> None:
     """
-    Расшифровывает речь из видео/аудио файла в текст.
+    Скачивает файлы модели с Hugging Face с ВКЛЮЧЁННЫМ tqdm-прогрессом
+    (в отличие от faster-whisper, который его глушит). Gradio перехватит
+    этот прогресс и покажет проценты/МБ. Если уже скачано — быстрая проверка.
+    """
+    import huggingface_hub
+    huggingface_hub.snapshot_download(
+        _repo_id(model_name),
+        cache_dir=WHISPER_DOWNLOAD_ROOT,
+        allow_patterns=_MODEL_FILES,
+    )
+
+
+def ensure_model(model_name: str) -> tuple[bool, str]:
+    """
+    Скачивает (при необходимости) и загружает модель в память.
+    Возвращает (успех, сообщение).
+    """
+    name = (model_name or WHISPER_MODEL).strip()
+    if name not in WHISPER_MODELS:
+        return False, f"[ERROR]Неизвестная модель: {name}"
+    try:
+        download_model_files(name)   # реальный прогресс через tqdm
+        _get_model(name)             # загрузка в память (из кеша, быстро)
+        return True, f"[OK]Модель «{name}» готова к работе ({WHISPER_COMPUTE_TYPE})."
+    except ImportError:
+        return False, "[ERROR]Не установлен faster-whisper (pip install faster-whisper)."
+    except Exception as e:
+        return False, f"[ERROR]Не удалось загрузить модель «{name}»: {str(e)}"
+
+
+def transcribe_media(file_path: str, model_name: str | None = None) -> tuple[str | None, str]:
+    """
+    Расшифровывает речь из видео/аудио файла в текст выбранной моделью.
 
     Возвращает (text, debug_info).
     """
@@ -119,12 +200,13 @@ def transcribe_media(file_path: str) -> tuple[str | None, str]:
     if not path.exists():
         return None, f"[ERROR]Файл не найден: {file_path}"
 
+    name = (model_name or WHISPER_MODEL).strip()
     size_mb = path.stat().st_size / (1024 * 1024)
     debug.append(f"[INFO]Файл: {path.name} ({size_mb:.1f} MB)")
-    debug.append(f"[INFO]Модель Whisper: {WHISPER_MODEL} ({WHISPER_COMPUTE_TYPE})")
+    debug.append(f"[INFO]Модель Whisper: {name} ({WHISPER_COMPUTE_TYPE})")
 
     try:
-        model = _get_model()
+        model = _get_model(name)
     except ImportError:
         return None, (
             "[ERROR]Не установлен faster-whisper.\n"
