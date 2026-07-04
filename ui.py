@@ -280,20 +280,20 @@ def create_app() -> gr.Blocks:
                     '<p>Расшифровка записей созвонов · Whisper ASR · экспорт .txt и .srt</p>'
                     '</div>'
                 )
-            with gr.Column(scale=1, min_width=110):
-                theme_btn = gr.Button("🌗 Тема", size="sm")
+            with gr.Column(scale=1, min_width=90):
+                theme_btn = gr.Button("🌗", size="sm")
         theme_btn.click(fn=None, inputs=None, outputs=None, js=THEME_TOGGLE_JS)
 
         with gr.Tabs():
 
             # ═════════════ Вкладка: Расшифровка ═════════════
             with gr.TabItem("🎙️ Расшифровка"):
-                with gr.Row(equal_height=False):
+                with gr.Row(equal_height=True):
 
                     # ЛЕВО — вход
                     with gr.Column(scale=1):
                         with gr.Group():
-                            gr.Markdown("### 🎥 Запись созвона")
+                            gr.Markdown("### Запись созвона")
                             media_input = gr.File(
                                 label="Видео или аудио",
                                 file_types=[
@@ -306,82 +306,85 @@ def create_app() -> gr.Blocks:
                             model_dd = gr.Dropdown(
                                 choices=_model_choices(),
                                 value=_default_model(),
-                                label="Модель  (✅ скачана · ⬇️ нет)",
-                                info="Крупнее — точнее, но медленнее. Скачивание — во вкладке «Модели».",
+                                label="Модель для распознавания",
+                                info="Крупнее — точнее, но медленнее. Скачать модели — во вкладке «Модели».",
                             )
-                            with gr.Accordion("⚙️ Параметры", open=False):
-                                line_per_segment_cb = gr.Checkbox(
-                                    label="Каждая реплика с новой строки",
-                                    value=False,
-                                    info="По одной реплике (фрагменту речи) на строку.",
-                                )
+                            line_per_segment_cb = gr.Checkbox(
+                                label="Каждая реплика с новой строки",
+                                value=False,
+                            )
                             with gr.Row():
                                 transcribe_btn = gr.Button(
-                                    "📝 Расшифровать", variant="primary", scale=3, interactive=False
+                                    "Расшифровать", variant="primary", scale=3, interactive=False
                                 )
-                                stop_transcribe_btn = gr.Button("⏹ Стоп", variant="stop", scale=1)
+                                stop_transcribe_btn = gr.Button(
+                                    "⏹ Стоп", variant="stop", scale=1, visible=False
+                                )
                             gr.Markdown(
-                                "<sub>Кнопка активна после загрузки файла. Если выбрана "
-                                "нескачанная модель — она сначала скачается. Не перезагружайте "
-                                "страницу во время процесса — результат сохранится в «Прошлых».</sub>"
+                                "<sub>Кнопка активна после загрузки файла. Нескачанная модель "
+                                "скачается автоматически.</sub>"
                             )
 
                     # ПРАВО — результат
                     with gr.Column(scale=1):
                         with gr.Group():
-                            gr.Markdown("### 📄 Результат")
+                            gr.Markdown("### Результат")
                             transcribe_status = gr.Textbox(
                                 label="Статус",
-                                lines=3,
+                                lines=2,
                                 interactive=False,
                                 placeholder="Загрузите запись и нажмите «Расшифровать»…",
                             )
                             transcript_text = gr.Textbox(
-                                label="Распознанный текст (можно редактировать)",
-                                lines=16,
+                                label="Распознанный текст",
+                                lines=15,
                                 interactive=True,
                                 show_copy_button=True,
-                                placeholder="Здесь появится расшифровка речи…",
+                                placeholder="Здесь появится расшифровка…",
                             )
                             transcript_files = gr.File(
-                                label="📥 Скачать: .txt и .srt (с таймкодами)",
+                                label="Файлы: .txt и .srt",
                                 file_count="multiple",
                             )
 
                 # История: открытие в один клик
-                with gr.Accordion("🕘 Прошлые расшифровки", open=True):
+                with gr.Accordion("Прошлые расшифровки", open=True):
                     with gr.Row():
                         history_dd = gr.Dropdown(
                             choices=[],
-                            label="Выберите запись, чтобы открыть её текст и файлы",
+                            label="Выберите запись, чтобы открыть",
                             scale=5,
                         )
-                        refresh_btn = gr.Button("🔄 Обновить", scale=1, min_width=120)
+                        refresh_btn = gr.Button("Обновить", scale=1, min_width=120)
 
             # ═════════════ Вкладка: Модели ═════════════
             with gr.TabItem("🧠 Модели"):
-                gr.Markdown("### 🧠 Управление моделями Whisper")
+                gr.Markdown("### Управление моделями")
                 gr.Markdown(
                     "Скачайте нужные модели заранее. Модель качается один раз и кешируется. "
-                    "Крупнее — точнее, но медленнее и больше размер. Прогресс — в полосе, "
-                    "статус — в поле ниже. Скачивание идёт по одной."
+                    "Крупнее — точнее, но медленнее и больше размер. Скачивание идёт по одной."
                 )
                 mgmt_dd = gr.Dropdown(
                     choices=_model_choices(),
                     value=_default_model(),
-                    label="Модель для скачивания  (✅ скачана · ⬇️ нет)",
+                    label="Модель для скачивания",
                 )
                 with gr.Row():
-                    download_btn = gr.Button("⬇️ Скачать", variant="primary", scale=3)
-                    stop_download_btn = gr.Button("⏹ Стоп", variant="stop", scale=1)
+                    download_btn = gr.Button("Скачать", variant="primary", scale=3)
+                    stop_download_btn = gr.Button(
+                        "⏹ Стоп", variant="stop", scale=1, visible=False
+                    )
                 model_status = gr.Textbox(
                     label="Статус модели",
-                    lines=3,
+                    lines=2,
                     interactive=False,
                     placeholder="Выберите модель и нажмите «Скачать».",
                 )
 
         # ══════════════ Обработчики ══════════════
+
+        _show_stop = lambda: (gr.update(visible=False), gr.update(visible=True))
+        _show_action = lambda: (gr.update(visible=True), gr.update(visible=False))
 
         # Кнопка «Расшифровать» активна только когда выбран файл
         media_input.change(
@@ -393,35 +396,43 @@ def create_app() -> gr.Blocks:
         # Статус модели при выборе во вкладке «Модели»
         mgmt_dd.change(fn=model_status_wrapper, inputs=[mgmt_dd], outputs=[model_status])
 
-        # Скачивание модели (сериализовано) + обновление меток в обоих списках
-        download_event = download_btn.click(
+        # ── Скачивание: показать «Стоп», качать, обновить метки, вернуть кнопку ──
+        dl_event = download_btn.click(
+            fn=_show_stop, outputs=[download_btn, stop_download_btn]
+        ).then(
             fn=download_model_wrapper,
             inputs=[mgmt_dd],
             outputs=[model_status],
             concurrency_limit=1,
         )
-        download_event.then(fn=refresh_models, inputs=[mgmt_dd], outputs=[mgmt_dd]) \
-                      .then(fn=refresh_models, inputs=[model_dd], outputs=[model_dd])
+        dl_event.then(fn=refresh_models, inputs=[mgmt_dd], outputs=[mgmt_dd]) \
+                .then(fn=refresh_models, inputs=[model_dd], outputs=[model_dd]) \
+                .then(fn=_show_action, outputs=[download_btn, stop_download_btn])
         stop_download_btn.click(
-            fn=lambda: "⏹ Остановлено. Частично скачанное догрузится при следующем запуске.",
-            outputs=[model_status],
-            cancels=[download_event],
+            fn=lambda: ("⏹ Остановлено. Частично скачанное догрузится позже.",
+                        gr.update(visible=True), gr.update(visible=False)),
+            outputs=[model_status, download_btn, stop_download_btn],
+            cancels=[dl_event],
         )
 
-        # Расшифровка → результат, затем обновить историю и метки моделей
-        transcribe_event = transcribe_btn.click(
+        # ── Расшифровка: показать «Стоп», распознать, обновить, вернуть кнопку ──
+        tr_event = transcribe_btn.click(
+            fn=_show_stop, outputs=[transcribe_btn, stop_transcribe_btn]
+        ).then(
             fn=transcribe_wrapper,
             inputs=[media_input, model_dd, line_per_segment_cb],
             outputs=[transcribe_status, transcript_text, transcript_files],
             show_progress_on=[transcribe_status],
         )
-        transcribe_event.then(fn=refresh_history, outputs=[history_dd]) \
-                        .then(fn=refresh_models, inputs=[model_dd], outputs=[model_dd]) \
-                        .then(fn=refresh_models, inputs=[mgmt_dd], outputs=[mgmt_dd])
+        tr_event.then(fn=refresh_history, outputs=[history_dd]) \
+                .then(fn=refresh_models, inputs=[model_dd], outputs=[model_dd]) \
+                .then(fn=refresh_models, inputs=[mgmt_dd], outputs=[mgmt_dd]) \
+                .then(fn=_show_action, outputs=[transcribe_btn, stop_transcribe_btn])
         stop_transcribe_btn.click(
-            fn=lambda: "⏹ Расшифровка остановлена.",
-            outputs=[transcribe_status],
-            cancels=[transcribe_event],
+            fn=lambda: ("⏹ Расшифровка остановлена.",
+                        gr.update(visible=True), gr.update(visible=False)),
+            outputs=[transcribe_status, transcribe_btn, stop_transcribe_btn],
+            cancels=[tr_event],
         )
 
         # История: открытие выбранной записи в один клик
