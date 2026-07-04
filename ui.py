@@ -321,7 +321,15 @@ def create_app() -> gr.Blocks:
             ],
             type="filepath",
         )
-        transcribe_btn = gr.Button("📝 Расшифровать", variant="primary", size="lg")
+        transcribe_btn = gr.Button(
+            "📝 Расшифровать", variant="primary", size="lg", interactive=False
+        )
+        gr.Markdown(
+            "_Кнопка станет активной после загрузки файла. Расшифровка длинной записи "
+            "идёт несколько минут — не меняйте тему и не перезагружайте страницу во время "
+            "процесса. Готовый результат в любом случае сохранится и появится в разделе "
+            "«Прошлые расшифровки»._"
+        )
 
         gr.Markdown("---")
 
@@ -358,6 +366,13 @@ def create_app() -> gr.Blocks:
             )
             refresh_btn = gr.Button("🔄 Обновить", scale=1)
         open_btn = gr.Button("📂 Открыть выбранную")
+
+        # Кнопка «Расшифровать» активна только когда выбран файл
+        media_input.change(
+            fn=lambda f: gr.update(interactive=bool(f)),
+            inputs=[media_input],
+            outputs=[transcribe_btn],
+        )
 
         # ── Обработчики истории ──
         refresh_btn.click(fn=refresh_history, outputs=[history_dd])
