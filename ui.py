@@ -22,73 +22,56 @@ from transcriber import (
 )
 
 
+# CSS на переменных темы — кастомные элементы сами следуют светлой/тёмной теме.
 CUSTOM_CSS = """
 .gradio-container {
     max-width: 1000px !important;
     margin: auto !important;
-    background: #1a1d24 !important;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 .header-text {
     text-align: center;
-    margin-bottom: 2rem;
-    padding: 2rem 1rem;
-    background: linear-gradient(135deg, #252a33 0%, #2d3440 100%);
+    margin-bottom: 1.5rem;
+    padding: 1.5rem 1rem;
+    background: var(--block-background-fill);
+    border: 1px solid var(--border-color-primary);
     border-radius: 12px;
-    border: 1px solid #353b47;
 }
 .header-text h1 {
-    font-size: 2.2rem;
-    margin-bottom: 0.5rem;
-    color: #e4e6eb;
+    font-size: 2rem;
+    margin-bottom: 0.4rem;
+    color: var(--body-text-color);
     font-weight: 600;
 }
 .header-text p {
-    color: #b0b8c1;
+    color: var(--body-text-color-subdued);
     font-size: 0.95rem;
     line-height: 1.6;
 }
-button {
-    background: #4a6785 !important;
-    color: #e4e6eb !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-weight: 500 !important;
-    transition: all 0.2s !important;
-}
-button:hover {
-    background: #5b7c99 !important;
-    transform: translateY(-1px);
-}
-input, textarea, select {
-    background: #2d3440 !important;
-    color: #e4e6eb !important;
-    border: 1px solid #353b47 !important;
-    border-radius: 8px !important;
-}
-label {
-    color: #b0b8c1 !important;
-    font-weight: 500 !important;
-}
 """
+
+# JS: переключение темы мгновенно, без перезагрузки (не прерывает процесс).
+THEME_TOGGLE_JS = "() => { document.body.classList.toggle('dark'); }"
+# JS при загрузке: стартуем в тёмной теме по умолчанию.
+INIT_DARK_JS = "() => { document.body.classList.add('dark'); }"
 
 
 def _build_theme() -> gr.themes.Base:
-    """Тёмная тема приложения."""
+    """Тема со светлой и тёмной палитрой (переключается классом .dark)."""
     return gr.themes.Soft(
         primary_hue=gr.themes.colors.slate,
         secondary_hue=gr.themes.colors.slate,
         neutral_hue=gr.themes.colors.slate,
     ).set(
-        body_background_fill="#1a1d24",
+        # Тёмная палитра (светлая берётся из дефолтов Soft)
         body_background_fill_dark="#1a1d24",
-        block_background_fill="#252a33",
         block_background_fill_dark="#252a33",
-        input_background_fill="#2d3440",
         input_background_fill_dark="#2d3440",
         button_primary_background_fill="#4a6785",
         button_primary_background_fill_hover="#5b7c99",
-        button_primary_text_color="#e4e6eb",
+        button_primary_text_color="#ffffff",
+        button_primary_background_fill_dark="#4a6785",
+        button_primary_background_fill_hover_dark="#5b7c99",
     )
 
 
@@ -264,7 +247,12 @@ def load_initial():
 def create_app() -> gr.Blocks:
     """Создаёт и возвращает Gradio-приложение."""
 
-    with gr.Blocks(title="Calls Recognize", theme=_build_theme(), css=CUSTOM_CSS) as app:
+    with gr.Blocks(
+        title="Calls Recognize",
+        theme=_build_theme(),
+        css=CUSTOM_CSS,
+        js=INIT_DARK_JS,   # по умолчанию — тёмная тема
+    ) as app:
 
         gr.HTML("""
         <div class="header-text">
@@ -275,6 +263,11 @@ def create_app() -> gr.Blocks:
             </p>
         </div>
         """)
+
+        with gr.Row():
+            theme_btn = gr.Button("🌗 Светлая / тёмная тема", size="sm", scale=0)
+        # Мгновенное переключение темы на клиенте (без перезагрузки и обрыва процесса)
+        theme_btn.click(fn=None, inputs=None, outputs=None, js=THEME_TOGGLE_JS)
 
         gr.Markdown("### 🧠 Модель распознавания")
         gr.Markdown(
