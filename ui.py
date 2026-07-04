@@ -12,6 +12,9 @@ from transcriber import (
     ensure_model,
     is_model_cached,
     model_status_text,
+    download_model_files,
+    list_transcripts,
+    read_transcript,
     WHISPER_MODEL,
     WHISPER_MODELS,
 )
@@ -123,33 +126,87 @@ def download_model_wrapper(model_choice: str, progress=gr.Progress(track_tqdm=Tr
         yield "❌ " + msg
 
 
-def transcribe_wrapper(media_file, model_choice: str, progress=gr.Progress(track_tqdm=False)):
+def transcribe_wrapper(media_file, model_choice: str, progress=gr.Progress(track_tqdm=True)):
     """
-    Расшифровка видео/аудио в текст выбранной моделью.
-    Возвращает: (статус, распознанный_текст, [файлы .txt/.srt]).
+    Расшифровка видео/аудио в текст выбранной моделью (генератор).
+    Показывает статус и реальный прогресс: скачивание модели (если нужно) +
+    распознавание по сегментам. Выдаёт: (статус, текст, [файлы .txt/.srt]).
     """
     if media_file is None:
-        return "❌ Загрузите видео или аудио файл.", "", None
+        yield "❌ Загрузите видео или аудио файл.", "", None
+        return
 
     file_path = media_file if isinstance(media_file, str) else media_file.name
 
     if not is_media_file(file_path):
-        return f"❌ Это не видео/аудио: {Path(file_path).name}", "", None
+        yield f"❌ Это не видео/аудио: {Path(file_path).name}", "", None
+        return
 
     name = _model_key(model_choice)
-    progress(0.1, desc=f"Модель «{name}»: распознавание (может занять несколько минут)...")
-    text, debug_info = transcribe_media(file_path, name)
-    progress(1.0, desc="Готово")
+
+    # Модель не скачана — сначала качаем (прогресс скачивания в полосе).
+    if not is_model_cached(name):
+        yield f"⏳ Модель «{name}» не скачана — качаю с Hugging Face...", "", None
+        try:
+            download_model_files(name)
+        except Exception as e:
+            yield f"❌ Не удалось скачать модель «{name}»: {str(e)}", "", None
+            return
+
+    yield f"🎧 Модель «{name}»: распознавание речи...", "", None
+
+    def cb(frac, desc):
+        progress(frac, desc=desc)
+
+    text, debug_info = transcribe_media(file_path, name, progress_callback=cb)
 
     if text is None or not text.strip():
-        return f"❌ Не удалось распознать речь.\n\n🔍 {debug_info}", "", None
+        yield f"❌ Не удалось распознать речь.\n\n🔍 {debug_info}", "", None
+        return
 
     txt_path = transcript_path_for(file_path)
     srt_path = txt_path.with_suffix(".srt")
     saved = [str(p) for p in (txt_path, srt_path) if p.exists()]
 
     status = f"✅ Файл: {Path(file_path).name}\n\n{debug_info}"
-    return status, text, (saved or None)
+    yield status, text, (saved or None)
+
+
+# ──────────────────────────────────────────────
+# Прошлые расшифровки (сохраняются на диск в output/)
+# ──────────────────────────────────────────────
+
+def _history_choices() -> list[tuple[str, str]]:
+    """Список (подпись, путь) сохранённых расшифровок, свежие первыми."""
+    import time
+    out = []
+    for p in list_transcripts():
+        mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime))
+        out.append((f"{p.parent.name}  ·  {mtime}", str(p)))
+    return out
+
+
+def refresh_history():
+    """Обновляет выпадающий список прошлых расшифровок."""
+    choices = _history_choices()
+    value = choices[0][1] if choices else None
+    return gr.update(choices=choices, value=value)
+
+
+def open_transcript(path: str):
+    """Открывает выбранную прошлую расшифровку (текст + файлы)."""
+    if not path:
+        return "", None
+    text, files = read_transcript(path)
+    return text, (files or None)
+
+
+def load_initial():
+    """При открытии страницы: последняя расшифровка + список прошлых."""
+    choices = _history_choices()
+    value = choices[0][1] if choices else None
+    text, files = read_transcript(value) if value else ("", [])
+    return gr.update(choices=choices, value=value), text, (files or None)
 
 
 def create_app() -> gr.Blocks:
@@ -234,6 +291,36 @@ def create_app() -> gr.Blocks:
             file_count="multiple",
         )
 
+        gr.Markdown("---")
+
+        gr.Markdown("### 🕘 Прошлые расшифровки")
+        gr.Markdown(
+            "Все расшифровки сохраняются на диск и доступны после перезагрузки страницы. "
+            "Выберите любую, чтобы снова открыть её текст и файлы."
+        )
+        with gr.Row():
+            history_dd = gr.Dropdown(
+                choices=[],
+                label="Сохранённые расшифровки",
+                scale=3,
+            )
+            refresh_btn = gr.Button("🔄 Обновить", scale=1)
+        open_btn = gr.Button("📂 Открыть выбранную")
+
+        # ── Обработчики истории ──
+        refresh_btn.click(fn=refresh_history, outputs=[history_dd])
+        open_btn.click(
+            fn=open_transcript,
+            inputs=[history_dd],
+            outputs=[transcript_text, transcript_files],
+        )
+
+        # При открытии страницы — последняя расшифровка + список прошлых
+        app.load(
+            fn=load_initial,
+            outputs=[history_dd, transcript_text, transcript_files],
+        )
+
         # При выборе модели в дропдауне — сразу показываем, скачана она или нет
         model_dd.change(
             fn=model_status_wrapper,
@@ -259,6 +346,9 @@ def create_app() -> gr.Blocks:
             fn=transcribe_wrapper,
             inputs=[media_input, model_dd],
             outputs=[transcribe_status, transcript_text, transcript_files],
+        ).then(
+            fn=refresh_history,
+            outputs=[history_dd],
         )
 
     app.queue()  # нужно для gr.Progress / track_tqdm
