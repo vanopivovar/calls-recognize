@@ -271,12 +271,14 @@ def transcribe_media(
     file_path: str,
     model_name: str | None = None,
     progress_callback=None,
+    line_per_segment: bool = False,
 ) -> tuple[str | None, str]:
     """
     Расшифровывает речь из видео/аудио файла в текст выбранной моделью.
 
     progress_callback(fraction: float, desc: str) — необязательный колбэк
     прогресса по ходу распознавания (доля обработанной длительности).
+    line_per_segment — если True, каждая реплика (сегмент) с новой строки.
 
     Возвращает (text, debug_info).
     """
@@ -341,7 +343,8 @@ def transcribe_media(
             debug.append("[WARN]Речь не распознана (тишина или нет дорожки?)")
             return None, "\n".join(debug)
 
-        text = " ".join(t for _, _, t in timed_segments)
+        sep = "\n" if line_per_segment else " "
+        text = sep.join(t for _, _, t in timed_segments)
         debug.append(f"[OK]Распознано фрагментов: {len(timed_segments)}")
         debug.append(f"[OK]Извлечено символов: {len(text)}")
 
