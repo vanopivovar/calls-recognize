@@ -92,9 +92,31 @@ def _build_theme() -> gr.themes.Base:
     )
 
 
+def _default_model() -> str:
+    """Ключ модели по умолчанию."""
+    return WHISPER_MODEL if WHISPER_MODEL in WHISPER_MODELS else "small"
+
+
 def _model_key(choice: str) -> str:
-    """Из подписи в дропдауне достаёт ключ модели (первое слово)."""
-    return (choice or WHISPER_MODEL).split()[0]
+    """Значение дропдауна — уже ключ модели; подстраховка для дефолта."""
+    return choice or _default_model()
+
+
+def _model_choices() -> list[tuple[str, str]]:
+    """
+    Пары (подпись, ключ) для дропдауна. Подпись содержит метку:
+    ✅ — модель уже скачана, ⬇️ — ещё нет.
+    """
+    out = []
+    for key, label in WHISPER_MODELS.items():
+        mark = "✅" if is_model_cached(key) else "⬇️"
+        out.append((f"{mark} {label}", key))
+    return out
+
+
+def refresh_models(selected: str):
+    """Пересобирает список моделей с актуальными метками ✅/⬇️, сохраняя выбор."""
+    return gr.update(choices=_model_choices(), value=selected or _default_model())
 
 
 def model_status_wrapper(model_choice: str) -> str:
@@ -264,9 +286,9 @@ def create_app() -> gr.Blocks:
         )
         with gr.Row():
             model_dd = gr.Dropdown(
-                choices=list(WHISPER_MODELS.values()),
-                value=WHISPER_MODELS.get(WHISPER_MODEL, list(WHISPER_MODELS.values())[2]),
-                label="Модель Whisper",
+                choices=_model_choices(),
+                value=_default_model(),
+                label="Модель Whisper  (✅ скачана · ⬇️ не скачана)",
                 scale=3,
             )
             download_btn = gr.Button("⬇️ Скачать / загрузить", scale=1)
@@ -363,6 +385,12 @@ def create_app() -> gr.Blocks:
             inputs=[model_dd],
             outputs=[model_status],
         )
+        # ...и актуальные метки ✅/⬇️ в списке моделей
+        app.load(
+            fn=refresh_models,
+            inputs=[model_dd],
+            outputs=[model_dd],
+        )
 
         # concurrency_limit=1 — скачивания сериализуются (по одной, очередью)
         download_btn.click(
@@ -370,6 +398,10 @@ def create_app() -> gr.Blocks:
             inputs=[model_dd],
             outputs=[model_status],
             concurrency_limit=1,
+        ).then(
+            fn=refresh_models,     # обновляем метку ✅ у скачанной модели
+            inputs=[model_dd],
+            outputs=[model_dd],
         )
 
         transcribe_btn.click(
@@ -379,6 +411,10 @@ def create_app() -> gr.Blocks:
         ).then(
             fn=refresh_history,
             outputs=[history_dd],
+        ).then(
+            fn=refresh_models,     # модель могла скачаться в процессе
+            inputs=[model_dd],
+            outputs=[model_dd],
         )
 
     app.queue()  # нужно для gr.Progress / track_tqdm
