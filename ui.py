@@ -14,6 +14,7 @@ from transcriber import (
     is_model_cached,
     model_status_text,
     download_model_files,
+    delete_model,
     model_total_bytes,
     downloaded_bytes,
     list_transcripts,
@@ -104,6 +105,37 @@ def refresh_models(selected: str):
 def model_status_wrapper(model_choice: str) -> str:
     """Статус выбранной модели (скачана / нет) — для дропдауна и загрузки страницы."""
     return model_status_text(_model_key(model_choice))
+
+
+def mgmt_buttons(model_choice: str):
+    """
+    Видимость кнопок во вкладке «Модели» по состоянию модели:
+    скачана → «Удалить», не скачана → «Скачать». «Стоп» всегда скрыт (idle).
+    Возвращает updates для (download_btn, stop_download_btn, delete_btn).
+    """
+    cached = is_model_cached(_model_key(model_choice))
+    return (
+        gr.update(visible=not cached),  # Скачать
+        gr.update(visible=False),       # Стоп
+        gr.update(visible=cached),      # Удалить
+    )
+
+
+def mgmt_select(model_choice: str):
+    """При выборе модели: статус + переключение кнопок Скачать/Удалить."""
+    return (model_status_wrapper(model_choice), *mgmt_buttons(model_choice))
+
+
+def delete_model_wrapper(model_choice: str) -> str:
+    """Удаляет выбранную модель из кеша."""
+    ok, msg = delete_model(_model_key(model_choice))
+    return ("✅ " if ok else "❌ ") + msg
+
+
+def stop_download_ui(model_choice: str):
+    """Отмена скачивания: сообщение + вернуть кнопки по факту (не докачано → «Скачать»)."""
+    d, s, x = mgmt_buttons(model_choice)
+    return "⏹ Остановлено. Частично скачанное догрузится позже.", d, s, x
 
 
 def _download_gen(name: str, progress):
@@ -370,15 +402,18 @@ def create_app() -> gr.Blocks:
                     label="Модель для скачивания",
                 )
                 with gr.Row():
-                    download_btn = gr.Button("Скачать", variant="primary", scale=3)
+                    download_btn = gr.Button("⬇️ Скачать", variant="primary", scale=3)
                     stop_download_btn = gr.Button(
                         "⏹ Стоп", variant="stop", scale=1, visible=False
+                    )
+                    delete_btn = gr.Button(
+                        "🗑 Удалить", variant="stop", scale=1, visible=False
                     )
                 model_status = gr.Textbox(
                     label="Статус модели",
                     lines=2,
                     interactive=False,
-                    placeholder="Выберите модель и нажмите «Скачать».",
+                    placeholder="Выберите модель: скачанную можно удалить, нескачанную — скачать.",
                 )
 
         # ══════════════ Обработчики ══════════════
@@ -393,10 +428,14 @@ def create_app() -> gr.Blocks:
             outputs=[transcribe_btn],
         )
 
-        # Статус модели при выборе во вкладке «Модели»
-        mgmt_dd.change(fn=model_status_wrapper, inputs=[mgmt_dd], outputs=[model_status])
+        # Выбор модели во вкладке «Модели»: статус + кнопки Скачать/Удалить
+        mgmt_dd.change(
+            fn=mgmt_select,
+            inputs=[mgmt_dd],
+            outputs=[model_status, download_btn, stop_download_btn, delete_btn],
+        )
 
-        # ── Скачивание: показать «Стоп», качать, обновить метки, вернуть кнопку ──
+        # ── Скачивание: показать «Стоп», качать, обновить метки и кнопки ──
         dl_event = download_btn.click(
             fn=_show_stop, outputs=[download_btn, stop_download_btn]
         ).then(
@@ -407,13 +446,22 @@ def create_app() -> gr.Blocks:
         )
         dl_event.then(fn=refresh_models, inputs=[mgmt_dd], outputs=[mgmt_dd]) \
                 .then(fn=refresh_models, inputs=[model_dd], outputs=[model_dd]) \
-                .then(fn=_show_action, outputs=[download_btn, stop_download_btn])
+                .then(fn=mgmt_buttons, inputs=[mgmt_dd],
+                      outputs=[download_btn, stop_download_btn, delete_btn])
         stop_download_btn.click(
-            fn=lambda: ("⏹ Остановлено. Частично скачанное догрузится позже.",
-                        gr.update(visible=True), gr.update(visible=False)),
-            outputs=[model_status, download_btn, stop_download_btn],
+            fn=stop_download_ui,
+            inputs=[mgmt_dd],
+            outputs=[model_status, download_btn, stop_download_btn, delete_btn],
             cancels=[dl_event],
         )
+
+        # ── Удаление модели из кеша → обновить метки и кнопки ──
+        delete_btn.click(
+            fn=delete_model_wrapper, inputs=[mgmt_dd], outputs=[model_status]
+        ).then(fn=refresh_models, inputs=[mgmt_dd], outputs=[mgmt_dd]) \
+         .then(fn=refresh_models, inputs=[model_dd], outputs=[model_dd]) \
+         .then(fn=mgmt_buttons, inputs=[mgmt_dd],
+               outputs=[download_btn, stop_download_btn, delete_btn])
 
         # ── Расшифровка: показать «Стоп», распознать, обновить, вернуть кнопку ──
         tr_event = transcribe_btn.click(
@@ -448,7 +496,11 @@ def create_app() -> gr.Blocks:
             fn=load_initial,
             outputs=[history_dd, transcript_text, transcript_files],
         )
-        app.load(fn=model_status_wrapper, inputs=[mgmt_dd], outputs=[model_status])
+        app.load(
+            fn=mgmt_select,
+            inputs=[mgmt_dd],
+            outputs=[model_status, download_btn, stop_download_btn, delete_btn],
+        )
         app.load(fn=refresh_models, inputs=[model_dd], outputs=[model_dd])
         app.load(fn=refresh_models, inputs=[mgmt_dd], outputs=[mgmt_dd])
 

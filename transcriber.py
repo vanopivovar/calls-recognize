@@ -188,6 +188,39 @@ def download_model_files(model_name: str) -> None:
     )
 
 
+def _model_cache_dir(model_name: str) -> Path:
+    """Каталог кеша модели (models--<repo>)."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+    root = Path(WHISPER_DOWNLOAD_ROOT) if WHISPER_DOWNLOAD_ROOT else Path(HF_HUB_CACHE)
+    repo = _repo_id(model_name).replace("/", "--")
+    return root / f"models--{repo}"
+
+
+def delete_model(model_name: str) -> tuple[bool, str]:
+    """
+    Удаляет скачанную модель из кеша и выгружает её из памяти.
+    Возвращает (успех, сообщение).
+    """
+    import shutil
+    name = (model_name or WHISPER_MODEL).strip()
+    if name not in WHISPER_MODELS:
+        return False, f"[ERROR]Неизвестная модель: {name}"
+
+    # Выгружаем из памяти (кеш загруженных моделей)
+    for key in list(_models):
+        if key[0] == name:
+            _models.pop(key, None)
+
+    model_dir = _model_cache_dir(name)
+    if not model_dir.exists():
+        return True, f"[OK]Модель «{name}» и так не скачана."
+    try:
+        shutil.rmtree(model_dir)
+        return True, f"[OK]Модель «{name}» удалена из кеша."
+    except Exception as e:  # noqa: BLE001
+        return False, f"[ERROR]Не удалось удалить «{name}»: {str(e)}"
+
+
 def model_total_bytes(model_name: str) -> int:
     """
     Суммарный размер файлов модели на Hugging Face (для показа прогресса).
