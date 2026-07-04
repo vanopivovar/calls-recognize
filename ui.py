@@ -11,6 +11,7 @@ from transcriber import (
     transcript_path_for,
     ensure_model,
     is_model_cached,
+    model_status_text,
     WHISPER_MODEL,
     WHISPER_MODELS,
 )
@@ -91,6 +92,11 @@ def _model_key(choice: str) -> str:
     return (choice or WHISPER_MODEL).split()[0]
 
 
+def model_status_wrapper(model_choice: str) -> str:
+    """Статус выбранной модели (скачана / нет) — для дропдауна и загрузки страницы."""
+    return model_status_text(_model_key(model_choice))
+
+
 def download_model_wrapper(model_choice: str, progress=gr.Progress(track_tqdm=True)):
     """
     Скачивает/загружает выбранную модель заранее (без расшифровки).
@@ -107,10 +113,14 @@ def download_model_wrapper(model_choice: str, progress=gr.Progress(track_tqdm=Tr
 
     yield (
         f"⏳ Скачиваю модель «{name}» с Hugging Face...\n"
-        "Прогресс — в полосе над кнопкой. Дождитесь завершения."
+        "Прогресс — в полосе над кнопкой. Крупные модели (3 ГБ) на анонимном\n"
+        "доступе качаются долго; «0/0 B» не значит зависание — идёт большой файл."
     )
     ok, msg = ensure_model(name)
-    yield ("✅ " if ok else "❌ ") + msg
+    if ok:
+        yield model_status_text(name)
+    else:
+        yield "❌ " + msg
 
 
 def transcribe_wrapper(media_file, model_choice: str, progress=gr.Progress(track_tqdm=False)):
@@ -222,6 +232,19 @@ def create_app() -> gr.Blocks:
         transcript_files = gr.File(
             label="📥 Скачать: текст (.txt) и субтитры с таймкодами (.srt)",
             file_count="multiple",
+        )
+
+        # При выборе модели в дропдауне — сразу показываем, скачана она или нет
+        model_dd.change(
+            fn=model_status_wrapper,
+            inputs=[model_dd],
+            outputs=[model_status],
+        )
+        # При открытии страницы — статус модели по умолчанию
+        app.load(
+            fn=model_status_wrapper,
+            inputs=[model_dd],
+            outputs=[model_status],
         )
 
         # concurrency_limit=1 — скачивания сериализуются (по одной, очередью)
