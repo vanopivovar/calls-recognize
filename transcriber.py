@@ -141,19 +141,41 @@ def _repo_id(model_name: str) -> str:
     return _MODELS.get(model_name, model_name)
 
 
-def is_model_cached(model_name: str) -> bool:
-    """True, если модель уже скачана локально (в кеше), без обращения к сети."""
+def cached_model_bin(model_name: str) -> Path | None:
+    """
+    Путь к model.bin, если модель скачана ПОЛНОСТЬЮ, иначе None.
+    Проверяет именно наличие model.bin — незавершённая загрузка
+    (только .incomplete/мелкие файлы) не считается скачанной.
+    """
     import huggingface_hub
     try:
-        huggingface_hub.snapshot_download(
+        snapshot = huggingface_hub.snapshot_download(
             _repo_id(model_name),
             cache_dir=WHISPER_DOWNLOAD_ROOT,
             allow_patterns=_MODEL_FILES,
             local_files_only=True,
         )
-        return True
     except Exception:
-        return False
+        return None
+    bin_path = Path(snapshot) / "model.bin"
+    return bin_path if bin_path.exists() else None
+
+
+def is_model_cached(model_name: str) -> bool:
+    """True, если модель полностью скачана (есть model.bin)."""
+    return cached_model_bin(model_name) is not None
+
+
+def model_status_text(model_name: str) -> str:
+    """Человекочитаемый статус модели для UI."""
+    name = (model_name or WHISPER_MODEL).strip()
+    if name not in WHISPER_MODELS:
+        return f"❓ Неизвестная модель: {name}"
+    b = cached_model_bin(name)
+    if b is not None:
+        mb = b.stat().st_size / (1024 * 1024)
+        return f"✅ «{name}» скачана ({mb:.0f} МБ). Можно распознавать — просто оставьте её выбранной."
+    return f"⬇️ «{name}» ещё не скачана. Нажмите «Скачать / загрузить» (или сразу «Расшифровать» — скачается автоматически)."
 
 
 def download_model_files(model_name: str) -> None:
