@@ -180,7 +180,7 @@ def download_model_wrapper(model_choice: str, progress=gr.Progress()):
     yield from _download_gen(name, progress)
 
 
-def transcribe_wrapper(media_file, model_choice: str, progress=gr.Progress()):
+def transcribe_wrapper(media_file, model_choice: str, line_per_segment: bool, progress=gr.Progress()):
     """
     Расшифровка видео/аудио в текст выбранной моделью (генератор).
     Показывает статус и реальный прогресс: скачивание модели (если нужно) +
@@ -210,7 +210,9 @@ def transcribe_wrapper(media_file, model_choice: str, progress=gr.Progress()):
     def cb(frac, desc):
         progress(frac, desc=desc)
 
-    text, debug_info = transcribe_media(file_path, name, progress_callback=cb)
+    text, debug_info = transcribe_media(
+        file_path, name, progress_callback=cb, line_per_segment=line_per_segment
+    )
 
     if text is None or not text.strip():
         yield f"❌ Не удалось распознать речь.\n\n🔍 {debug_info}", "", None
@@ -331,6 +333,11 @@ def create_app() -> gr.Blocks:
             ],
             type="filepath",
         )
+        line_per_segment_cb = gr.Checkbox(
+            label="Каждая реплика с новой строки",
+            value=False,
+            info="Разбивать текст по фрагментам речи (по одной реплике на строку).",
+        )
         transcribe_btn = gr.Button(
             "📝 Расшифровать", variant="primary", size="lg", interactive=False
         )
@@ -431,7 +438,7 @@ def create_app() -> gr.Blocks:
 
         transcribe_btn.click(
             fn=transcribe_wrapper,
-            inputs=[media_input, model_dd],
+            inputs=[media_input, model_dd, line_per_segment_cb],
             outputs=[transcribe_status, transcript_text, transcript_files],
             show_progress_on=[transcribe_status],  # один бар, только на «Статус»
         ).then(
