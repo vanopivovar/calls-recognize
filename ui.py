@@ -13,6 +13,8 @@ from transcriber import (
     is_model_cached,
     model_status_text,
     download_model_files,
+    model_total_bytes,
+    downloaded_bytes,
     list_transcripts,
     read_transcript,
     WHISPER_MODEL,
@@ -100,33 +102,63 @@ def model_status_wrapper(model_choice: str) -> str:
     return model_status_text(_model_key(model_choice))
 
 
-def download_model_wrapper(model_choice: str, progress=gr.Progress(track_tqdm=True)):
+def _download_gen(name: str, progress):
     """
-    Скачивает/загружает выбранную модель заранее (без расшифровки).
-    Генератор: статус обновляется по ходу, прогресс скачивания — в полосе выше
-    (track_tqdm перехватывает загрузку с Hugging Face).
+    Общий генератор скачивания модели с РЕАЛЬНЫМ прогрессом:
+    качает в фоновом потоке и раз в секунду опрашивает размер на диске.
+    Выдаёт строки статуса; двигает полосу прогресса.
     """
-    name = _model_key(model_choice)
+    import threading
+    import time
 
     if is_model_cached(name):
-        yield f"⏳ Модель «{name}» уже скачана — загружаю в память..."
-        ok, msg = ensure_model(name)
-        yield ("✅ " if ok else "❌ ") + msg + "  (была в кеше, без скачивания)"
+        yield f"✅ Модель «{name}» уже скачана — загружаю в память..."
+        ensure_model(name)
+        yield model_status_text(name)
         return
 
-    yield (
-        f"⏳ Скачиваю модель «{name}» с Hugging Face...\n"
-        "Прогресс — в полосе над кнопкой. Крупные модели (3 ГБ) на анонимном\n"
-        "доступе качаются долго; «0/0 B» не значит зависание — идёт большой файл."
-    )
-    ok, msg = ensure_model(name)
-    if ok:
-        yield model_status_text(name)
-    else:
-        yield "❌ " + msg
+    total = model_total_bytes(name)
+    err = {}
+
+    def _run():
+        try:
+            download_model_files(name)
+        except Exception as e:  # noqa: BLE001
+            err["e"] = e
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+
+    mb = 1024 * 1024
+    while th.is_alive():
+        done = downloaded_bytes(name)
+        if total:
+            frac = min(done / total, 0.99)
+            try:
+                progress(frac, desc=f"{done/mb:.0f}/{total/mb:.0f} МБ")
+            except Exception:
+                pass
+            yield f"⏳ Скачиваю «{name}»: {done/mb:.0f} / {total/mb:.0f} МБ ({frac*100:.0f}%)"
+        else:
+            yield f"⏳ Скачиваю «{name}»: {done/mb:.0f} МБ скачано..."
+        time.sleep(1.0)
+
+    th.join()
+    if err:
+        yield f"❌ Не удалось скачать «{name}»: {err['e']}"
+        return
+
+    ensure_model(name)  # загрузка в память из кеша
+    yield model_status_text(name)
 
 
-def transcribe_wrapper(media_file, model_choice: str, progress=gr.Progress(track_tqdm=True)):
+def download_model_wrapper(model_choice: str, progress=gr.Progress()):
+    """Скачивает/загружает выбранную модель заранее (без расшифровки)."""
+    name = _model_key(model_choice)
+    yield from _download_gen(name, progress)
+
+
+def transcribe_wrapper(media_file, model_choice: str, progress=gr.Progress()):
     """
     Расшифровка видео/аудио в текст выбранной моделью (генератор).
     Показывает статус и реальный прогресс: скачивание модели (если нужно) +
@@ -144,13 +176,11 @@ def transcribe_wrapper(media_file, model_choice: str, progress=gr.Progress(track
 
     name = _model_key(model_choice)
 
-    # Модель не скачана — сначала качаем (прогресс скачивания в полосе).
+    # Модель не скачана — сначала качаем (с реальным прогрессом).
     if not is_model_cached(name):
-        yield f"⏳ Модель «{name}» не скачана — качаю с Hugging Face...", "", None
-        try:
-            download_model_files(name)
-        except Exception as e:
-            yield f"❌ Не удалось скачать модель «{name}»: {str(e)}", "", None
+        for status in _download_gen(name, progress):
+            yield status, "", None
+        if not is_model_cached(name):  # скачивание не удалось
             return
 
     yield f"🎧 Модель «{name}»: распознавание речи...", "", None
