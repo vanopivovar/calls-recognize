@@ -179,17 +179,57 @@ def model_status_text(model_name: str) -> str:
 
 
 def download_model_files(model_name: str) -> None:
-    """
-    Скачивает файлы модели с Hugging Face с ВКЛЮЧЁННЫМ tqdm-прогрессом
-    (в отличие от faster-whisper, который его глушит). Gradio перехватит
-    этот прогресс и покажет проценты/МБ. Если уже скачано — быстрая проверка.
-    """
+    """Скачивает файлы модели с Hugging Face (блокирующе)."""
     import huggingface_hub
     huggingface_hub.snapshot_download(
         _repo_id(model_name),
         cache_dir=WHISPER_DOWNLOAD_ROOT,
         allow_patterns=_MODEL_FILES,
     )
+
+
+def model_total_bytes(model_name: str) -> int:
+    """
+    Суммарный размер файлов модели на Hugging Face (для показа прогресса).
+    0, если не удалось узнать (тогда прогресс покажем без общего размера).
+    """
+    import fnmatch
+    import huggingface_hub
+    try:
+        info = huggingface_hub.HfApi().model_info(
+            _repo_id(model_name), files_metadata=True
+        )
+    except Exception:
+        return 0
+    total = 0
+    for s in info.siblings:
+        size = getattr(s, "size", None)
+        if size and any(fnmatch.fnmatch(s.rfilename, pat) for pat in _MODEL_FILES):
+            total += size
+    return total
+
+
+def _blobs_dir(model_name: str) -> Path:
+    """Каталог blobs, куда huggingface_hub качает файлы модели."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+    root = Path(WHISPER_DOWNLOAD_ROOT) if WHISPER_DOWNLOAD_ROOT else Path(HF_HUB_CACHE)
+    repo = _repo_id(model_name).replace("/", "--")
+    return root / f"models--{repo}" / "blobs"
+
+
+def downloaded_bytes(model_name: str) -> int:
+    """Сколько байт модели уже на диске (включая незавершённый .incomplete)."""
+    d = _blobs_dir(model_name)
+    if not d.exists():
+        return 0
+    total = 0
+    for f in d.iterdir():
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
 
 
 def ensure_model(model_name: str) -> tuple[bool, str]:
