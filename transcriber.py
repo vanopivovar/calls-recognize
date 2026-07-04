@@ -210,9 +210,33 @@ def ensure_model(model_name: str) -> tuple[bool, str]:
         return False, f"[ERROR]Не удалось загрузить модель «{name}»: {str(e)}"
 
 
-def transcribe_media(file_path: str, model_name: str | None = None) -> tuple[str | None, str]:
+def list_transcripts() -> list[Path]:
+    """Все сохранённые .txt расшифровки из output/, свежие первыми."""
+    if not OUTPUT_DIR.exists():
+        return []
+    txts = [p for p in OUTPUT_DIR.glob("*/*.txt")]
+    return sorted(txts, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def read_transcript(txt_path: str | Path) -> tuple[str, list[str]]:
+    """Текст расшифровки + список сопутствующих файлов (.txt и .srt)."""
+    p = Path(txt_path)
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    srt = p.with_suffix(".srt")
+    files = [str(x) for x in (p, srt) if x.exists()]
+    return text, files
+
+
+def transcribe_media(
+    file_path: str,
+    model_name: str | None = None,
+    progress_callback=None,
+) -> tuple[str | None, str]:
     """
     Расшифровывает речь из видео/аудио файла в текст выбранной моделью.
+
+    progress_callback(fraction: float, desc: str) — необязательный колбэк
+    прогресса по ходу распознавания (доля обработанной длительности).
 
     Возвращает (text, debug_info).
     """
@@ -264,6 +288,14 @@ def transcribe_media(file_path: str, model_name: str | None = None) -> tuple[str
             seg_text = (seg.text or "").strip()
             if seg_text:
                 timed_segments.append((seg.start, seg.end, seg_text))
+
+            # Реальный прогресс по доле обработанной длительности.
+            if progress_callback and duration:
+                try:
+                    frac = min((seg.end or 0.0) / duration, 0.99)
+                    progress_callback(frac, f"Распознано {seg.end:.0f}/{duration:.0f} сек")
+                except Exception:
+                    pass
 
         if not timed_segments:
             debug.append("[WARN]Речь не распознана (тишина или нет дорожки?)")
