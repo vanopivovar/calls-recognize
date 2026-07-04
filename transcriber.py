@@ -267,6 +267,50 @@ def read_transcript(txt_path: str | Path) -> tuple[str, list[str]]:
     return text, files
 
 
+def open_segments(file_path: str, model_name: str | None = None):
+    """
+    Готовит модель и запускает распознавание. Возвращает (segments, info, name)
+    либо (None, None, error_text). segments — ленивый генератор faster-whisper:
+    если перестать по нему итерироваться, распознавание останавливается —
+    это и позволяет реализовать кнопку «Стоп».
+    """
+    path = Path(file_path)
+    if not path.exists():
+        return None, None, f"[ERROR]Файл не найден: {file_path}"
+
+    name = (model_name or WHISPER_MODEL).strip()
+    try:
+        model = _get_model(name)
+    except ImportError:
+        return None, None, "[ERROR]Не установлен faster-whisper (pip install faster-whisper)."
+    except Exception as e:  # noqa: BLE001
+        return None, None, f"[ERROR]Не удалось загрузить модель «{name}»: {str(e)}"
+
+    language = WHISPER_LANGUAGE.strip().lower()
+    if language in ("", "auto"):
+        language = None
+    try:
+        segments, info = model.transcribe(
+            str(path), language=language, beam_size=5, vad_filter=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        return None, None, f"[ERROR]Ошибка расшифровки: {str(e)}"
+    return segments, info, name
+
+
+def save_transcription(
+    file_path: str,
+    timed_segments: list[tuple[float, float, str]],
+    line_per_segment: bool = False,
+) -> str:
+    """Сохраняет .txt и .srt, возвращает итоговый текст."""
+    sep = "\n" if line_per_segment else " "
+    text = sep.join(t for _, _, t in timed_segments)
+    _save_transcript(Path(file_path), text)
+    _save_srt(Path(file_path), timed_segments)
+    return text
+
+
 def transcribe_media(
     file_path: str,
     model_name: str | None = None,
