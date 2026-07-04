@@ -1,0 +1,28 @@
+services:
+  calls-recognize:
+    build: .
+    container_name: calls-recognize
+    ports:
+      - "7861:7861"
+    volumes:
+      # Расшифровки сохраняются на хосте
+      - ./output:/app/output
+      # Кеш модели Whisper (чтобы не качать при пересборке)
+      - whisper_cache:/app/whisper
+    environment:
+      - WHISPER_MODEL=small        # tiny/base/small/medium/large-v3 (точность vs скорость)
+      - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_LANGUAGE=ru        # ru или auto для автоопределения
+      - WHISPER_DOWNLOAD_ROOT=/app/whisper
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7861
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+volumes:
+  whisper_cache:
