@@ -408,6 +408,7 @@ def create_app() -> gr.Blocks:
             fn=transcribe_wrapper,
             inputs=[media_input, model_dd],
             outputs=[transcribe_status, transcript_text, transcript_files],
+            show_progress_on=[transcribe_status],  # один бар, только на «Статус»
         ).then(
             fn=refresh_history,
             outputs=[history_dd],
