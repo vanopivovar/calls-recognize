@@ -36,6 +36,7 @@ CUSTOM_CSS = """
     background: var(--block-background-fill);
     border: 1px solid var(--border-color-primary);
     border-radius: 12px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
 }
 .header-text h1 {
     font-size: 2rem;
@@ -47,6 +48,11 @@ CUSTOM_CSS = """
     color: var(--body-text-color-subdued);
     font-size: 0.95rem;
     line-height: 1.6;
+}
+/* Заметное разделение блоков (особенно в светлой теме) */
+.block {
+    border: 1px solid var(--border-color-primary) !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 """
 
@@ -63,10 +69,21 @@ def _build_theme() -> gr.themes.Base:
         secondary_hue=gr.themes.colors.slate,
         neutral_hue=gr.themes.colors.slate,
     ).set(
-        # Тёмная палитра (светлая берётся из дефолтов Soft)
+        # Светлая палитра: мягкий серый фон страницы, белые блоки, заметные границы
+        body_background_fill="#eef1f5",
+        block_background_fill="#ffffff",
+        block_border_color="#d5dbe2",
+        border_color_primary="#d5dbe2",
+        input_background_fill="#ffffff",
+        input_border_color="#cfd6de",
+        # Тёмная палитра
         body_background_fill_dark="#1a1d24",
         block_background_fill_dark="#252a33",
+        block_border_color_dark="#353b47",
+        border_color_primary_dark="#353b47",
         input_background_fill_dark="#2d3440",
+        input_border_color_dark="#353b47",
+        # Основная кнопка — одинаковая в обеих темах
         button_primary_background_fill="#4a6785",
         button_primary_background_fill_hover="#5b7c99",
         button_primary_text_color="#ffffff",
