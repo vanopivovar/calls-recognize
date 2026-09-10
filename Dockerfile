@@ -24,11 +24,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Приложение
 COPY config.py .
 COPY transcriber.py .
+COPY service.py .
 COPY ui.py .
 COPY app.py .
 
-# Директории (output — расшифровки, whisper — кеш модели)
-RUN mkdir -p /app/output /app/whisper
+# Директории (input — записи, output — расшифровки, whisper — кеш модели)
+RUN mkdir -p /app/input /app/output /app/whisper
+ENV INPUT_DIR=/app/input
+ENV OUTPUT_DIR=/app/output
 
 # Переменные окружения
 ENV WHISPER_MODEL=small

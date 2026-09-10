@@ -7,8 +7,9 @@ build/
 venv/
 .venv/
 
-# Output (расшифровки)
+# Output (расшифровки) и входные записи
 output/
+input/
 
 # Whisper model cache
 whisper/
