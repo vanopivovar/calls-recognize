@@ -8,11 +8,12 @@
 импорт этого модуля не тянет тяжёлых зависимостей и не качает модель.
 """
 
+import json
 import os
 import re
 from pathlib import Path
 
-from config import OUTPUT_DIR
+from config import OUTPUT_DIR, SETTINGS_PATH
 
 # Размер модели Whisper. Чем больше — тем точнее и медленнее.
 # tiny / base / small / medium / large-v3
@@ -219,6 +220,133 @@ def delete_model(model_name: str) -> tuple[bool, str]:
         return True, f"[OK]Модель «{name}» удалена из кеша."
     except Exception as e:  # noqa: BLE001
         return False, f"[ERROR]Не удалось удалить «{name}»: {str(e)}"
+
+
+# ──────────────────────────────────────────────
+# Версии моделей и проверка обновлений
+# ──────────────────────────────────────────────
+
+def local_revision(model_name: str) -> str | None:
+    """
+    SHA коммита скачанной модели. huggingface_hub хранит снапшот в каталоге
+    snapshots/<sha>; берём тот, где реально лежит model.bin.
+    """
+    snap_root = _model_cache_dir(model_name) / "snapshots"
+    if not snap_root.exists():
+        return None
+    for d in snap_root.iterdir():
+        if d.is_dir() and (d / "model.bin").exists():
+            return d.name
+    return None
+
+
+def remote_revision(model_name: str) -> str | None:
+    """SHA актуального коммита модели на Hugging Face (сетевой запрос)."""
+    import huggingface_hub
+    try:
+        return huggingface_hub.HfApi().model_info(_repo_id(model_name)).sha
+    except Exception:
+        return None
+
+
+def update_available(model_name: str) -> bool | None:
+    """
+    Есть ли обновление: локальный SHA != удалённый.
+    None — проверить нельзя (модель не скачана или нет сети).
+    """
+    loc = local_revision(model_name)
+    if not loc:
+        return None
+    rem = remote_revision(model_name)
+    if not rem:
+        return None
+    return loc != rem
+
+
+# ──────────────────────────────────────────────
+# Настройки: какие модели доступны пользователю
+# ──────────────────────────────────────────────
+
+def load_settings() -> dict:
+    """Читает settings.json (пустой словарь, если нет/битый)."""
+    try:
+        return json.loads(Path(SETTINGS_PATH).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(settings: dict) -> None:
+    p = Path(SETTINGS_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def enabled_models() -> list[str]:
+    """Список моделей, доступных для выбора/скачивания (по умолчанию — все)."""
+    names = load_settings().get("enabled_models")
+    valid = [n for n in (names or []) if n in WHISPER_MODELS]
+    return valid or list(WHISPER_MODELS)
+
+
+def set_enabled_models(names: list[str]) -> tuple[bool, str]:
+    """Сохраняет набор доступных моделей (минимум одна, только известные)."""
+    valid = [n for n in (names or []) if n in WHISPER_MODELS]
+    if not valid:
+        return False, "[ERROR]Нужно оставить хотя бы одну модель."
+    s = load_settings()
+    s["enabled_models"] = valid
+    save_settings(s)
+    return True, f"[OK]Доступные модели: {', '.join(valid)}."
+
+
+def model_info_row(model_name: str, check_remote: bool = False) -> dict:
+    """Сводка по модели для таблицы/API."""
+    b = cached_model_bin(model_name)
+    return {
+        "name": model_name,
+        "label": WHISPER_MODELS.get(model_name, model_name),
+        "downloaded": b is not None,
+        "size_mb": round(b.stat().st_size / (1024 * 1024)) if b else 0,
+        "enabled": model_name in enabled_models(),
+        "local_revision": (local_revision(model_name) or "")[:8],
+        "update_available": update_available(model_name) if (check_remote and b) else None,
+    }
+
+
+# ──────────────────────────────────────────────
+# Обход папок с записями
+# ──────────────────────────────────────────────
+
+def iter_media_files(path: str | Path) -> list[Path]:
+    """
+    Файл → [файл] (если это медиа). Папка → все медиа внутри (рекурсивно),
+    отсортированные по имени. Иначе — пустой список.
+    """
+    p = Path(path)
+    if p.is_file():
+        return [p] if is_media_file(str(p)) else []
+    if p.is_dir():
+        return sorted(
+            f for f in p.rglob("*") if f.is_file() and is_media_file(str(f))
+        )
+    return []
+
+
+def write_manifest(source_path: str | Path, meta: dict) -> Path:
+    """Пишет meta.json рядом с расшифровкой (модель, язык, длительность и т.п.)."""
+    mp = transcript_path_for(source_path).parent / "meta.json"
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    mp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return mp
+
+
+def read_manifest(txt_path: str | Path) -> dict:
+    """Читает meta.json для данной расшифровки (пусто, если нет)."""
+    mp = Path(txt_path).parent / "meta.json"
+    try:
+        return json.loads(mp.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def model_total_bytes(model_name: str) -> int:
