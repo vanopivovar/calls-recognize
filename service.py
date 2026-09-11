@@ -215,3 +215,8 @@ def api_list_transcripts() -> list[dict]:
 def api_read_transcript(name: str) -> dict:
     """Текст расшифровки по имени (имя папки в output/) или пути к .txt."""
     return read_transcript(name)
+
+
+def api_runtime() -> dict:
+    """Среда выполнения: device (cuda/cpu), compute_type, gpu_name, cpu_threads, beam_size."""
+    return T.runtime_info()

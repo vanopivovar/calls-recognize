@@ -32,8 +32,83 @@ WHISPER_MODELS = {
     "large-v3-turbo": "large-v3-turbo (~1.6 ГБ, почти как v3, но быстрее)",
 }
 
-# Тип вычислений CTranslate2 на CPU. int8 — быстро и экономно по памяти.
-WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
+# Устройство: auto (GPU, если доступна CUDA; иначе CPU) | cuda | cpu
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "auto").strip().lower() or "auto"
+
+# Тип вычислений CTranslate2. Пусто → float16 на GPU, int8 на CPU.
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "").strip()
+
+# Потоки CPU для CPU-режима: по умолчанию все ядра (CTranslate2 сам берёт лишь 4).
+WHISPER_CPU_THREADS = int(os.environ.get("WHISPER_CPU_THREADS", "0") or 0) or (os.cpu_count() or 4)
+
+# Ширина beam search: 5 — точнее, 1–2 — заметно быстрее.
+WHISPER_BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5") or 5)
+
+# Разрешённая среда выполнения (заполняется лениво при первом обращении).
+_runtime: dict | None = None
+
+
+def _cuda_available() -> bool:
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def _gpu_name() -> str:
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = out.stdout.strip().splitlines()
+        return lines[0].strip() if out.returncode == 0 and lines else "CUDA GPU"
+    except Exception:
+        return "CUDA GPU"
+
+
+def resolve_runtime() -> dict:
+    """
+    Определяет устройство и тип вычислений один раз:
+    {device, compute_type, cpu_threads, beam_size, gpu_name, note}.
+    """
+    global _runtime
+    if _runtime is not None:
+        return _runtime
+    device, note = "cpu", ""
+    if WHISPER_DEVICE in ("auto", "cuda"):
+        if _cuda_available():
+            device = "cuda"
+        elif WHISPER_DEVICE == "cuda":
+            note = "CUDA запрошена, но недоступна — работаю на CPU"
+        else:
+            note = "CUDA не найдена — работаю на CPU"
+    compute = WHISPER_COMPUTE_TYPE or ("float16" if device == "cuda" else "int8")
+    _runtime = {
+        "device": device,
+        "compute_type": compute,
+        "cpu_threads": WHISPER_CPU_THREADS,
+        "beam_size": WHISPER_BEAM_SIZE,
+        "gpu_name": _gpu_name() if device == "cuda" else None,
+        "note": note,
+    }
+    return _runtime
+
+
+def runtime_info() -> dict:
+    """Публичная сводка о среде выполнения (для UI/API)."""
+    return dict(resolve_runtime())
+
+
+def runtime_label() -> str:
+    rt = resolve_runtime()
+    if rt["device"] == "cuda":
+        return f"GPU · {rt['gpu_name']} · {rt['compute_type']}"
+    return f"CPU · {rt['cpu_threads']} потоков · {rt['compute_type']}" + (
+        f" ({rt['note']})" if rt["note"] else ""
+    )
 
 # Язык по умолчанию. Пусто/auto → автоопределение.
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "ru")
@@ -110,18 +185,39 @@ def _get_model(model_name: str | None = None):
     При первом обращении к незнакомой модели faster-whisper скачает её.
     """
     name = model_name or WHISPER_MODEL
-    key = (name, WHISPER_COMPUTE_TYPE)
+    rt = resolve_runtime()
+    key = (name, rt["device"], rt["compute_type"])
     if key in _models:
         return _models[key]
 
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(
-        name,
-        device="cpu",
-        compute_type=WHISPER_COMPUTE_TYPE,
-        download_root=WHISPER_DOWNLOAD_ROOT,
-    )
+    try:
+        model = WhisperModel(
+            name,
+            device=rt["device"],
+            compute_type=rt["compute_type"],
+            download_root=WHISPER_DOWNLOAD_ROOT,
+            cpu_threads=rt["cpu_threads"],
+        )
+    except Exception as e:  # noqa: BLE001
+        if rt["device"] != "cuda":
+            raise
+        # GPU есть, но библиотеки/драйвер не дали её использовать — откат на CPU.
+        rt.update(
+            device="cpu",
+            compute_type=WHISPER_COMPUTE_TYPE or "int8",
+            gpu_name=None,
+            note=f"GPU недоступна ({str(e)[:90]}) — откат на CPU",
+        )
+        key = (name, "cpu", rt["compute_type"])
+        model = WhisperModel(
+            name,
+            device="cpu",
+            compute_type=rt["compute_type"],
+            download_root=WHISPER_DOWNLOAD_ROOT,
+            cpu_threads=rt["cpu_threads"],
+        )
     _models[key] = model
     return model
 
@@ -404,7 +500,7 @@ def ensure_model(model_name: str) -> tuple[bool, str]:
     try:
         download_model_files(name)   # реальный прогресс через tqdm
         _get_model(name)             # загрузка в память (из кеша, быстро)
-        return True, f"[OK]Модель «{name}» готова к работе ({WHISPER_COMPUTE_TYPE})."
+        return True, f"[OK]Модель «{name}» готова к работе ({runtime_label()})."
     except ImportError:
         return False, "[ERROR]Не установлен faster-whisper (pip install faster-whisper)."
     except Exception as e:
@@ -452,7 +548,7 @@ def open_segments(file_path: str, model_name: str | None = None):
         language = None
     try:
         segments, info = model.transcribe(
-            str(path), language=language, beam_size=5, vad_filter=True,
+            str(path), language=language, beam_size=WHISPER_BEAM_SIZE, vad_filter=True,
         )
     except Exception as e:  # noqa: BLE001
         return None, None, f"[ERROR]Ошибка расшифровки: {str(e)}"
@@ -496,7 +592,7 @@ def transcribe_media(
     name = (model_name or WHISPER_MODEL).strip()
     size_mb = path.stat().st_size / (1024 * 1024)
     debug.append(f"[INFO]Файл: {path.name} ({size_mb:.1f} MB)")
-    debug.append(f"[INFO]Модель Whisper: {name} ({WHISPER_COMPUTE_TYPE})")
+    debug.append(f"[INFO]Модель Whisper: {name} ({runtime_label()})")
 
     try:
         model = _get_model(name)
@@ -516,7 +612,7 @@ def transcribe_media(
         segments, info = model.transcribe(
             str(path),
             language=language,
-            beam_size=5,
+            beam_size=WHISPER_BEAM_SIZE,
             vad_filter=True,  # отсекаем тишину/паузы — точнее на созвонах
         )
 

@@ -13,7 +13,10 @@ services:
       - whisper_cache:/app/whisper
     environment:
       - WHISPER_MODEL=small        # tiny/base/small/medium/large-v3 (точность vs скорость)
-      - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_DEVICE=auto        # auto: GPU если есть CUDA, иначе CPU | cuda | cpu
+      - WHISPER_BEAM_SIZE=5        # 5 — точнее; 1–2 — быстрее
+      # - WHISPER_COMPUTE_TYPE=    # пусто = float16 на GPU / int8 на CPU
+      # - WHISPER_CPU_THREADS=     # пусто = все ядра
       - WHISPER_LANGUAGE=ru        # ru или auto для автоопределения
       - WHISPER_DOWNLOAD_ROOT=/app/whisper
       - GRADIO_SERVER_NAME=0.0.0.0
@@ -25,9 +28,15 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 6G
         reservations:
           memory: 1G
+          # Проброс NVIDIA GPU (нужен драйвер на хосте и Docker Desktop с WSL2).
+          # На машине без GPU закомментируйте блок devices — сервис заработает на CPU.
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
 volumes:
   whisper_cache:

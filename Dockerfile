@@ -21,6 +21,20 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# CUDA-библиотеки для GPU-режима (CTranslate2 нужны cuBLAS и cuDNN 9).
+# Wheels скачиваются на хосте в wheels/ (через прокси Docker Desktop большие
+# файлы с PyPI приходят битыми) и ставятся из локальной папки:
+#   py -m pip download nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70 \
+#      nvidia-nvjitlink-cu12==12.4.127 --only-binary=:all: --python-version 3.11 \
+#      --implementation cp --platform manylinux2014_x86_64 -d wheels
+# Драйвер приходит с хоста через --gpus all. Без GPU не мешают — откат на CPU.
+COPY wheels/ /tmp/wheels/
+RUN pip install --no-cache-dir --no-index --find-links /tmp/wheels \
+    nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70 \
+    nvidia-nvjitlink-cu12==12.4.127 \
+    && rm -rf /tmp/wheels
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib
+
 # Приложение
 COPY config.py .
 COPY transcriber.py .
@@ -35,7 +49,8 @@ ENV OUTPUT_DIR=/app/output
 
 # Переменные окружения
 ENV WHISPER_MODEL=small
-ENV WHISPER_COMPUTE_TYPE=int8
+ENV WHISPER_DEVICE=auto
+ENV WHISPER_BEAM_SIZE=5
 ENV WHISPER_LANGUAGE=ru
 ENV WHISPER_DOWNLOAD_ROOT=/app/whisper
 ENV GRADIO_SERVER_NAME=0.0.0.0

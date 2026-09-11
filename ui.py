@@ -23,6 +23,7 @@ from transcriber import (
     is_model_cached,
     model_status_text,
     model_total_bytes,
+    runtime_label,
 )
 
 
@@ -331,6 +332,11 @@ def read_transcript(name: str) -> dict:
     return S.api_read_transcript(name)
 
 
+def runtime() -> dict:
+    """Среда выполнения сервиса: device (cuda/cpu), gpu_name, compute_type, cpu_threads, beam_size."""
+    return S.api_runtime()
+
+
 # ──────────────────────────────────────────────
 # Приложение
 # ──────────────────────────────────────────────
@@ -350,6 +356,7 @@ def create_app() -> gr.Blocks:
                     '<div class="app-title">'
                     '<h2>📝 Calls Recognize</h2>'
                     '<p>Расшифровка записей созвонов · Whisper ASR · экспорт .txt и .srt · MCP</p>'
+                    f'<p>Ускорение: {runtime_label()}</p>'
                     '</div>'
                 )
             with gr.Column(scale=1, min_width=90):
@@ -440,6 +447,7 @@ def create_app() -> gr.Blocks:
 
             # ═════════════ Вкладка: Модели ═════════════
             with gr.TabItem("🧠 Модели"):
+                gr.Markdown(f"**Среда выполнения:** {runtime_label()}")
                 gr.Markdown("### Состояние моделей")
                 models_df = gr.Dataframe(
                     headers=TABLE_HEADERS,
@@ -593,6 +601,7 @@ def create_app() -> gr.Blocks:
         gr.api(transcribe, api_name="transcribe")
         gr.api(list_transcripts, api_name="list_transcripts")
         gr.api(read_transcript, api_name="read_transcript")
+        gr.api(runtime, api_name="runtime")
 
     app.queue()
     return app
