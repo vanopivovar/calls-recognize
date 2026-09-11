@@ -16,6 +16,8 @@ whisper/
 
 # Build artifacts
 build.log
+# CUDA wheels для сборки образа (качаются на хост, ~1 ГБ — в git не нужны)
+wheels/
 
 # OS
 .DS_Store
