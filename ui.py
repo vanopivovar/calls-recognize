@@ -5,7 +5,8 @@ Gradio-интерфейс Calls Recognize — расшифровка созво�
 обработчики и регистрация API-эндпоинтов (они же — MCP-инструменты).
 """
 
-import threading
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -108,26 +109,44 @@ def refresh_models_all(selected: str):
     return refresh_models(selected, only_enabled=False)
 
 
+UI_JOB = "ui"  # идентификатор активной расшифровки из интерфейса
+_dl_procs: dict[str, subprocess.Popen] = {}  # активные скачивания: модель -> процесс
+
+
+def _kill_downloads() -> int:
+    """Прерывает все активные скачивания (убивает подпроцессы). Возвращает число."""
+    n = 0
+    for name, proc in list(_dl_procs.items()):
+        try:
+            proc.kill()
+            n += 1
+        except Exception:
+            pass
+        _dl_procs.pop(name, None)
+    return n
+
+
 def _download_gen(name: str, progress):
-    """Скачивание в фоне + опрос реального размера на диске раз в секунду."""
+    """
+    Скачивание в ОТДЕЛЬНОМ ПРОЦЕССЕ + опрос реального размера на диске.
+    Кнопка «Стоп» убивает процесс — загрузка с сети реально прерывается
+    (в отличие от потока, который остановить нельзя).
+    """
     if is_model_cached(name):
         ensure_model(name)
         yield model_status_text(name)
         return
 
     total = model_total_bytes(name)
-    err = {}
-
-    def _run():
-        try:
-            download_model_files(name)
-        except Exception as e:  # noqa: BLE001
-            err["e"] = e
-
-    th = threading.Thread(target=_run, daemon=True)
-    th.start()
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         f"import transcriber as t; t.download_model_files({name!r})"],
+        cwd=str(Path(__file__).resolve().parent),
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    _dl_procs[name] = proc
     mb = 1024 * 1024
-    while th.is_alive():
+    while proc.poll() is None:
         done = downloaded_bytes(name)
         if total:
             frac = min(done / total, 0.99)
@@ -139,9 +158,10 @@ def _download_gen(name: str, progress):
         else:
             yield f"⏳ Скачиваю «{name}»: {done/mb:.0f} МБ…"
         time.sleep(1.0)
-    th.join()
-    if err:
-        yield f"❌ Не удалось скачать «{name}»: {err['e']}"
+    _dl_procs.pop(name, None)
+    if proc.returncode != 0:
+        err = (proc.stderr.read() or b"").decode("utf-8", "ignore").strip().splitlines()
+        yield f"❌ Не удалось скачать «{name}»: {err[-1][:160] if err else 'код ' + str(proc.returncode)}"
         return
     ensure_model(name)
     yield model_status_text(name)
@@ -166,8 +186,12 @@ def mgmt_select(model_choice: str):
 
 
 def stop_download_ui(model_choice: str):
+    """«Стоп» скачивания: убить процесс загрузки, вернуть кнопки по факту."""
+    killed = _kill_downloads()
     d, s, x = mgmt_buttons(model_choice)
-    return "⏹ Остановлено. Частично скачанное догрузится позже.", d, s, x
+    msg = ("⏹ Скачивание прервано. Частично скачанное продолжится при следующем запуске."
+           if killed else "⏹ Остановлено.")
+    return msg, d, s, x
 
 
 TABLE_HEADERS = ["Модель", "Скачана", "МБ", "Обновление", "Доступна"]
@@ -213,7 +237,12 @@ def _collect_sources(uploaded, explorer) -> list[str]:
 
 def transcribe_wrapper(uploaded, explorer, model_choice: str, line_per_segment: bool,
                        progress=gr.Progress()):
-    """Батч: каждый файл → отдельный результат. Выдаёт (лог, текст последнего, файлы)."""
+    """
+    Батч: каждый файл → отдельный результат. Выдаёт (лог, текст последнего, файлы).
+    Цикл по сегментам идёт через генератор сервиса и регулярно возвращает
+    управление Gradio (yield) — поэтому «Стоп» прерывает распознавание сразу,
+    а не по окончании файла.
+    """
     sources = _collect_sources(uploaded, explorer)
     if not sources:
         yield "❌ Выберите файл(ы) или папку.", "", None
@@ -241,23 +270,46 @@ def transcribe_wrapper(uploaded, explorer, model_choice: str, line_per_segment: 
     for i, f in enumerate(files, 1):
         log.append(f"⏳ [{i}/{n}] {Path(f).name}")
         yield "\n".join(log), last_text, (produced or None)
-
-        def cb(frac, desc, _i=i):
-            progress((_i - 1 + frac) / n, desc=f"[{_i}/{n}] {desc}")
-
-        r = S.transcribe_file(f, name, line_per_segment, progress_callback=cb)
-        if r["ok"]:
-            log[-1] = (f"✅ [{i}/{n}] {Path(f).name} — {r['segments']} фрагм., "
-                       f"{r.get('duration') or 0:.0f} сек")
-            produced += [r["txt"], r["srt"]]
-            last_text = r["text"]
-        else:
-            log[-1] = f"❌ [{i}/{n}] {Path(f).name} — {r['error']}"
+        last_tick = 0.0
+        for ev in S.iter_transcribe_file(f, name, line_per_segment, job_id=UI_JOB):
+            if ev[0] == "progress":
+                now = time.time()
+                if now - last_tick >= 0.5:  # точка отмены + обновление не чаще 2 раз/с
+                    last_tick = now
+                    progress((i - 1 + ev[1]) / n, desc=f"[{i}/{n}] {ev[2]}")
+                    log[-1] = f"⏳ [{i}/{n}] {Path(f).name} — {ev[2]}"
+                    yield "\n".join(log), last_text, (produced or None)
+            elif ev[0] == "error":
+                log[-1] = f"❌ [{i}/{n}] {Path(f).name} — {ev[1]}"
+            elif ev[0] == "done":
+                r = ev[1]
+                log[-1] = (f"✅ [{i}/{n}] {Path(f).name} — {r['segments']} фрагм., "
+                           f"{r.get('duration') or 0:.0f} сек")
+                produced += [r["txt"], r["srt"]]
+                last_text = r["text"]
         yield "\n".join(log), last_text, (produced or None)
 
     ok = sum(1 for l in log if l.startswith("✅"))
     log.append(f"Готово: {ok}/{n}. Файлы — в output/<имя>/")
     yield "\n".join(log), last_text, (produced or None)
+
+
+def stop_transcribe_ui():
+    """
+    «Стоп» распознавания: прервать скачивание (если шло), сохранить уже
+    распознанное как частичный результат и вернуть кнопки.
+    """
+    _kill_downloads()
+    r = S.stop_job(UI_JOB)
+    if r and r.get("ok"):
+        dur = r.get("duration")
+        total = f"/{dur:.0f}" if dur else ""
+        msg = (f"⏹ Остановлено. Частичный результат сохранён: {r['segments']} фрагм., "
+               f"{r['covered']:.0f}{total} сек → {Path(r['txt']).parent.name}/")
+        return msg, gr.update(visible=True), gr.update(visible=False), r["text"], [r["txt"], r["srt"]]
+    if r:
+        return f"⏹ Остановлено. {r['error']}", gr.update(visible=True), gr.update(visible=False), "", None
+    return "⏹ Остановлено.", gr.update(visible=True), gr.update(visible=False), gr.update(), gr.update()
 
 
 # ──────────────────────────────────────────────
@@ -268,6 +320,9 @@ def _history_choices() -> list[tuple[str, str]]:
     out = []
     for r in S.list_transcripts():
         extra = f"  ·  {r['created']}" + (f"  ·  {r['model']}" if r.get("model") else "")
+        if r.get("partial"):
+            dur = r.get("duration")
+            extra += f"  ·  ⏹ частично {r.get('covered') or 0:.0f}{f'/{dur:.0f}' if dur else ''} с"
         out.append((f"{r['name']}{extra}", r["txt"]))
     return out
 
@@ -395,6 +450,7 @@ def create_app() -> gr.Blocks:
                                         height=240,
                                     )
                                     explorer_refresh = gr.Button("Обновить список", size="sm")
+                                    explorer_tick = gr.State(0)
                             model_dd = gr.Dropdown(
                                 choices=_model_choices(True),
                                 value=_default_model(),
@@ -515,8 +571,13 @@ def create_app() -> gr.Blocks:
                            outputs=[transcribe_btn], api_name=False)
         explorer.change(fn=_has_sources, inputs=[media_input, explorer],
                         outputs=[transcribe_btn], api_name=False)
-        explorer_refresh.click(fn=lambda: gr.update(root_dir=str(INPUT_DIR)),
-                               outputs=[explorer], api_name=False)
+        def _explorer_refresh(tick):
+            tick = (tick or 0) + 1
+            glob = "**/*" if tick % 2 else "**/[!~]*"  # другой glob → Gradio перечитает папку
+            return gr.update(root_dir=str(INPUT_DIR), glob=glob, value=[]), tick
+
+        explorer_refresh.click(fn=_explorer_refresh, inputs=[explorer_tick],
+                               outputs=[explorer, explorer_tick], api_name=False)
 
         # Модели: выбор → статус + кнопки
         mgmt_dd.change(fn=mgmt_select, inputs=[mgmt_dd],
@@ -563,7 +624,7 @@ def create_app() -> gr.Blocks:
             fn=transcribe_wrapper,
             inputs=[media_input, explorer, model_dd, line_per_segment_cb],
             outputs=[transcribe_status, transcript_text, transcript_files],
-            show_progress_on=[transcribe_status], api_name=False,
+            show_progress_on=[transcribe_status], concurrency_limit=1, api_name=False,
         )
         tr_event.then(fn=refresh_history, outputs=[history_dd], api_name=False) \
                 .then(fn=refresh_models_enabled, inputs=[model_dd], outputs=[model_dd], api_name=False) \
@@ -571,11 +632,11 @@ def create_app() -> gr.Blocks:
                 .then(fn=lambda: models_table(False), outputs=[models_df], api_name=False) \
                 .then(fn=_show_action, outputs=[transcribe_btn, stop_transcribe_btn], api_name=False)
         stop_transcribe_btn.click(
-            fn=lambda: ("⏹ Расшифровка остановлена.", gr.update(visible=True),
-                        gr.update(visible=False)),
-            outputs=[transcribe_status, transcribe_btn, stop_transcribe_btn],
+            fn=stop_transcribe_ui,
+            outputs=[transcribe_status, transcribe_btn, stop_transcribe_btn,
+                     transcript_text, transcript_files],
             cancels=[tr_event], api_name=False,
-        )
+        ).then(fn=refresh_history, outputs=[history_dd], api_name=False)
 
         # История
         history_dd.change(fn=open_transcript, inputs=[history_dd],

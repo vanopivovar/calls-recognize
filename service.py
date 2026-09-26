@@ -54,6 +54,112 @@ def iter_media_files(path: str | Path) -> list[Path]:
     return T.iter_media_files(path)
 
 
+# Активные расшифровки: job_id -> состояние (для «Стоп» с сохранением частичного).
+_jobs: dict[str, dict] = {}
+
+
+def _finalize(state: dict, partial: bool) -> dict:
+    """Сохраняет .txt/.srt/meta.json из накопленных сегментов и возвращает результат."""
+    p = Path(state["path"])
+    timed = list(state["timed"])
+    text = T.save_transcription(str(p), timed, state["lps"])
+    txt = T.transcript_path_for(p)
+    srt = txt.with_suffix(".srt")
+    duration = state.get("duration")
+    covered = round(timed[-1][1], 1) if timed else 0.0
+    meta_row = {
+        "source": str(p),
+        "model": state["model"],
+        "language": state.get("language"),
+        "duration": round(duration, 1) if duration else None,
+        "covered": covered,
+        "segments": len(timed),
+        "partial": bool(partial),
+        "line_per_segment": bool(state["lps"]),
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    T.write_manifest(p, meta_row)
+    return {"ok": True, "txt": str(txt), "srt": str(srt), "text": text, **meta_row}
+
+
+def iter_transcribe_file(
+    path: str,
+    model: str | None = None,
+    line_per_segment: bool = False,
+    job_id: str | None = None,
+):
+    """
+    Генератор расшифровки ОДНОГО файла. Выдаёт:
+      ("progress", fraction, desc)  — по ходу распознавания,
+      ("error", message)            — при ошибке,
+      ("done", result_dict)         — в конце (файлы сохранены).
+    Цикл по сегментам живёт здесь, поэтому вызывающая сторона может
+    прервать его (перестать итерироваться) — и Whisper остановится.
+    Если задан job_id, состояние доступно stop_job() для частичного сохранения.
+    """
+    p = Path(path)
+    if not p.exists():
+        yield ("error", "Файл не найден."); return
+    if not T.is_media_file(str(p)):
+        yield ("error", "Это не видео/аудио."); return
+
+    name = (model or T.WHISPER_MODEL).strip()
+    if name not in T.WHISPER_MODELS:
+        yield ("error", f"Неизвестная модель: {name}"); return
+
+    if not T.is_model_cached(name):
+        try:
+            T.download_model_files(name)
+        except Exception as e:  # noqa: BLE001
+            yield ("error", f"Не удалось скачать модель: {e}"); return
+
+    segments, info, meta = T.open_segments(str(p), name)
+    if segments is None:
+        yield ("error", str(meta)); return
+
+    duration = getattr(info, "duration", None)
+    state = {
+        "path": str(p), "model": name, "lps": bool(line_per_segment),
+        "timed": [], "duration": duration, "language": getattr(info, "language", None),
+    }
+    if job_id:
+        _jobs[job_id] = state
+
+    completed = False
+    try:
+        for seg in segments:
+            text = (seg.text or "").strip()
+            if text:
+                state["timed"].append((seg.start, seg.end, text))
+            if duration:
+                frac = min((seg.end or 0.0) / duration, 0.99)
+                yield ("progress", frac, f"{seg.end:.0f}/{duration:.0f} сек")
+        if not state["timed"]:
+            completed = True
+            yield ("error", "Речь не распознана (тишина / нет дорожки)."); return
+        result = _finalize(state, partial=False)
+        completed = True
+        yield ("done", result)
+    finally:
+        # При нормальном завершении убираем состояние. При отмене (генератор
+        # брошен) оставляем — его заберёт stop_job() и сохранит частичное.
+        if completed and job_id:
+            _jobs.pop(job_id, None)
+
+
+def stop_job(job_id: str) -> dict | None:
+    """
+    Завершает остановленную расшифровку: сохраняет уже распознанное как
+    частичный результат (partial=True). None — активной задачи нет.
+    """
+    state = _jobs.pop(job_id, None)
+    if not state:
+        return None
+    if not state["timed"]:
+        return {"ok": False, "source": state["path"], "error": "Ничего не успело распознаться."}
+    return _finalize(state, partial=True)
+
+
 def transcribe_file(
     path: str,
     model: str | None = None,
@@ -62,58 +168,20 @@ def transcribe_file(
 ) -> dict:
     """
     Расшифровать ОДИН файл → один результат (.txt + .srt + meta.json).
-    progress_callback(fraction, desc) — необязательный колбэк прогресса.
+    Блокирующая обёртка над iter_transcribe_file (для MCP/API).
     """
-    p = Path(path)
-    if not p.exists():
-        return {"ok": False, "source": str(p), "error": "Файл не найден."}
-    if not T.is_media_file(str(p)):
-        return {"ok": False, "source": str(p), "error": "Это не видео/аудио."}
-
-    name = (model or T.WHISPER_MODEL).strip()
-    if name not in T.WHISPER_MODELS:
-        return {"ok": False, "source": str(p), "error": f"Неизвестная модель: {name}"}
-
-    if not T.is_model_cached(name):
-        try:
-            T.download_model_files(name)
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "source": str(p), "error": f"Не удалось скачать модель: {e}"}
-
-    segments, info, meta = T.open_segments(str(p), name)
-    if segments is None:
-        return {"ok": False, "source": str(p), "error": str(meta)}
-
-    duration = getattr(info, "duration", None)
-    timed: list[tuple[float, float, str]] = []
-    for seg in segments:
-        text = (seg.text or "").strip()
-        if text:
-            timed.append((seg.start, seg.end, text))
-        if progress_callback and duration:
-            try:
-                frac = min((seg.end or 0.0) / duration, 0.99)
-                progress_callback(frac, f"{seg.end:.0f}/{duration:.0f} сек")
-            except Exception:
-                pass
-
-    if not timed:
-        return {"ok": False, "source": str(p), "error": "Речь не распознана (тишина / нет дорожки)."}
-
-    text = T.save_transcription(str(p), timed, line_per_segment)
-    txt = T.transcript_path_for(p)
-    srt = txt.with_suffix(".srt")
-    meta_row = {
-        "source": str(p),
-        "model": name,
-        "language": getattr(info, "language", None),
-        "duration": round(duration, 1) if duration else None,
-        "segments": len(timed),
-        "line_per_segment": bool(line_per_segment),
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    T.write_manifest(p, meta_row)
-    return {"ok": True, "txt": str(txt), "srt": str(srt), "text": text, **meta_row}
+    for ev in iter_transcribe_file(path, model, line_per_segment):
+        if ev[0] == "progress":
+            if progress_callback:
+                try:
+                    progress_callback(ev[1], ev[2])
+                except Exception:
+                    pass
+        elif ev[0] == "error":
+            return {"ok": False, "source": str(path), "error": ev[1]}
+        elif ev[0] == "done":
+            return ev[1]
+    return {"ok": False, "source": str(path), "error": "Расшифровка прервана."}
 
 
 def transcribe_path(
@@ -161,6 +229,8 @@ def list_transcripts() -> list[dict]:
             "model": meta.get("model"),
             "duration": meta.get("duration"),
             "segments": meta.get("segments"),
+            "partial": bool(meta.get("partial")),
+            "covered": meta.get("covered"),
         })
     return out
 
