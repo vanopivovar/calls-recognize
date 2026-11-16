@@ -91,6 +91,8 @@ def _finalize(state: dict, partial: bool) -> dict:
         "speakers": speakers,
         "diarization_error": state.get("diar_error"),
         "diarization_runtime": state.get("diar_runtime"),
+        "repair_error": state.get("repair_error"),
+        "failure": state.get("failure"),
     }
     mp = txt.parent / "meta.json"
     mp.write_text(json.dumps(meta_row, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -177,34 +179,40 @@ def iter_transcribe_file(
         #  • сегмент почти без слов (Whisper «проглотил» речь внутри окна);
         #  • пропуск между сегментами, где детектор речи слышит речь.
         yield ("progress", asr_share, "ищу потерянную речь")
-        audio = T.load_audio(str(p))
+        audio = None
         state["repaired"], state["lost_left"] = [], []
-        lost = [i for i, s in enumerate(state["segs"]) if T.is_lost_speech(s)]
-        for k, i in enumerate(reversed(lost), 1):
-            old = state["segs"][i]
-            yield ("progress", asr_share, f"повтор потерянного куска {k}/{len(lost)} ({_hms(old['start'])})")
-            new = T.retranscribe_range(name, audio, old["start"], old["end"], hotwords)
-            old_words = len(old["text"].split())
-            new_words = sum(len(s["text"].split()) for s in new)
-            span = f"{_hms(old['start'])}–{_hms(old['end'])}"
-            if new_words > old_words * 1.5 and new_words - old_words >= 5:
-                state["segs"][i:i + 1] = new
-                state["repaired"].append(f"{span}: было слов {old_words}, стало {new_words}")
-            else:
-                state["lost_left"].append(f"{span}: {old['text']}")
+        # Сбой на этом этапе (например, кончилась видеопамять) не должен стоить
+        # уже распознанного текста: записываем причину и идём сохранять.
+        try:
+            audio = T.load_audio(str(p))
+            lost = [i for i, s in enumerate(state["segs"]) if T.is_lost_speech(s)]
+            for k, i in enumerate(reversed(lost), 1):
+                old = state["segs"][i]
+                yield ("progress", asr_share, f"повтор потерянного куска {k}/{len(lost)} ({_hms(old['start'])})")
+                new = T.retranscribe_range(name, audio, old["start"], old["end"], hotwords)
+                old_words = len(old["text"].split())
+                new_words = sum(len(s["text"].split()) for s in new)
+                span = f"{_hms(old['start'])}–{_hms(old['end'])}"
+                if new_words > old_words * 1.5 and new_words - old_words >= 5:
+                    state["segs"][i:i + 1] = new
+                    state["repaired"].append(f"{span}: было слов {old_words}, стало {new_words}")
+                else:
+                    state["lost_left"].append(f"{span}: {old['text']}")
 
-        gaps = [g for g in T.find_gaps(state["segs"], duration)
-                if T.speech_share(audio, *g) >= T.GAP_MIN_SPEECH]
-        for k, (a, b) in enumerate(gaps, 1):
-            yield ("progress", asr_share, f"повтор пропуска {k}/{len(gaps)} ({_hms(a)})")
-            new = T.retranscribe_range(name, audio, a, b, hotwords)
-            new_words = sum(len(s["text"].split()) for s in new)
-            span = f"{_hms(a)}–{_hms(b)}"
-            if new_words >= 3:
-                state["segs"].extend(new)
-                state["repaired"].append(f"{span}: пропуск, восстановлено слов {new_words}")
-            else:
-                state["lost_left"].append(f"{span}: пропуск, речь слышна, но не распознана")
+            gaps = [g for g in T.find_gaps(state["segs"], duration)
+                    if T.speech_share(audio, *g) >= T.GAP_MIN_SPEECH]
+            for k, (a, b) in enumerate(gaps, 1):
+                yield ("progress", asr_share, f"повтор пропуска {k}/{len(gaps)} ({_hms(a)})")
+                new = T.retranscribe_range(name, audio, a, b, hotwords)
+                new_words = sum(len(s["text"].split()) for s in new)
+                span = f"{_hms(a)}–{_hms(b)}"
+                if new_words >= 3:
+                    state["segs"].extend(new)
+                    state["repaired"].append(f"{span}: пропуск, восстановлено слов {new_words}")
+                else:
+                    state["lost_left"].append(f"{span}: пропуск, речь слышна, но не распознана")
+        except Exception as e:  # noqa: BLE001
+            state["repair_error"] = f"Поиск потерянной речи прерван: {e}"
         state["segs"].sort(key=lambda s: s["start"])
         state["repaired"].sort()
         state["lost_left"].sort()
@@ -213,6 +221,8 @@ def iter_transcribe_file(
             try:
                 import diarizer as D
                 yield ("progress", asr_share, "разделяю по говорящим")
+                if audio is None:
+                    audio = T.load_audio(str(p))
                 turns = D.diarize(audio, num_speakers)
                 state["diar_runtime"] = D.runtime_info()
                 state["utterances"] = D.assign_speakers(state["segs"], turns)
@@ -222,9 +232,26 @@ def iter_transcribe_file(
         result = _finalize(state, partial=False)
         completed = True
         yield ("done", result)
+    except GeneratorExit:
+        # Отмена: генератор брошен вызывающей стороной. Состояние оставляем —
+        # его заберёт stop_job() и сохранит частичный результат.
+        raise
+    except Exception as e:  # noqa: BLE001
+        # Сбой посреди работы: сохраняем то, что успело распознаться.
+        completed = True
+        state["failure"] = str(e)
+        saved = None
+        if state["segs"]:
+            try:
+                saved = _finalize(state, partial=True)
+            except Exception:  # noqa: BLE001
+                saved = None
+        if saved:
+            yield ("done", saved)
+        else:
+            yield ("error", f"Расшифровка прервана: {e}")
     finally:
-        # При нормальном завершении убираем состояние. При отмене (генератор
-        # брошен) оставляем — его заберёт stop_job() и сохранит частичное.
+        # При завершении и при сбое убираем состояние; при отмене оно остаётся.
         if completed and job_id:
             _jobs.pop(job_id, None)
 
@@ -240,6 +267,11 @@ def stop_job(job_id: str) -> dict | None:
     if not state["segs"]:
         return {"ok": False, "source": state["path"], "error": "Ничего не успело распознаться."}
     return _finalize(state, partial=True)
+
+
+def discard_job(job_id: str) -> None:
+    """Забывает состояние расшифровки без сохранения (остаток от закрытой вкладки)."""
+    _jobs.pop(job_id, None)
 
 
 def transcribe_file(
@@ -269,12 +301,29 @@ def transcribe_file(
     return {"ok": False, "source": str(path), "error": "Расшифровка прервана."}
 
 
-def _resolve(path: str) -> Path:
-    """Относительный путь ищется в INPUT_DIR."""
-    p = Path(path)
-    if not p.is_absolute() and not p.exists():
+OUTSIDE_INPUT = "Путь вне папки input: расшифровывать можно только файлы и папки из неё."
+
+
+def _inside(p: Path, root: Path) -> Path | None:
+    """Настоящий путь p, если он лежит внутри root (с учётом .. и ссылок), иначе None."""
+    try:
+        real = p.resolve()
+        real.relative_to(root.resolve())
+    except (ValueError, OSError):
+        return None
+    return real
+
+
+def _resolve(path: str) -> Path | None:
+    """
+    Путь для расшифровки через API. Относительный ищется в INPUT_DIR, абсолютный
+    должен лежать в ней же. Всё, что вне INPUT_DIR, — None: сервис без пароля
+    не должен читать произвольные файлы.
+    """
+    p = Path(str(path or "").strip())
+    if not p.is_absolute():
         p = INPUT_DIR / p
-    return p
+    return _inside(p, INPUT_DIR)
 
 
 def transcribe_path(
@@ -290,6 +339,8 @@ def transcribe_path(
     Относительный путь ищется в INPUT_DIR.
     """
     p = _resolve(path)
+    if p is None:
+        return [{"ok": False, "source": str(path), "error": OUTSIDE_INPUT}]
     files = T.iter_media_files(p)
     if not files:
         return [{"ok": False, "source": str(p), "error": "Нет видео/аудио по этому пути."}]
@@ -372,6 +423,8 @@ def start_job(path: str, model: str | None = None, line_per_segment: bool = True
     """Ставит расшифровку файла или папки в очередь. Возвращает {job_id, status, files}."""
     global _bg_worker
     p = _resolve(path)
+    if p is None:
+        return {"ok": False, "error": OUTSIDE_INPUT}
     files = [str(f) for f in T.iter_media_files(p)]
     if not files:
         return {"ok": False, "error": f"Нет видео/аудио по пути: {p}"}
@@ -436,9 +489,16 @@ def list_transcripts() -> list[dict]:
 
 def read_transcript(name_or_path: str) -> dict:
     """Текст и файлы расшифровки по имени папки или пути к .txt."""
-    p = Path(name_or_path)
+    p = Path(str(name_or_path or "").strip())
     if p.suffix != ".txt":
         p = OUTPUT_DIR / p.name / f"{p.name}.txt"
+    elif not p.is_absolute() and not p.exists():
+        p = OUTPUT_DIR / p
+    real = _inside(p, OUTPUT_DIR)
+    if real is None:  # читать можно только расшифровки из папки результатов
+        return {"ok": False, "name": "", "text": "", "files": [], "meta": {},
+                "error": "Путь вне папки output."}
+    p = real
     text, files = T.read_transcript(p)
     return {"ok": p.exists(), "name": p.parent.name, "text": text, "files": files,
             "meta": T.read_manifest(p)}
@@ -471,8 +531,8 @@ def api_set_enabled_models(names: list[str]) -> dict:
 def api_transcribe(path: str, model: str = "", line_per_segment: bool = False,
                    diarize: bool = False, num_speakers: int = 0) -> list[dict]:
     """
-    Расшифровать файл или папку. Путь — внутри контейнера (/app/input/...)
-    или относительный к папке input. Один файл = один результат.
+    Расшифровать файл или папку из папки input. Путь — относительный к ней
+    или полный внутри контейнера (/app/input/...). Один файл = один результат.
     """
     return transcribe_path(path, model or None, line_per_segment,
                            diarize=diarize, num_speakers=num_speakers)

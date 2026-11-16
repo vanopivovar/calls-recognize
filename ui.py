@@ -109,7 +109,12 @@ def refresh_models_all(selected: str):
     return refresh_models(selected, only_enabled=False)
 
 
-UI_JOB = "ui"  # идентификатор активной расшифровки из интерфейса
+def _ui_job(request) -> str:
+    """Идентификатор расшифровки из интерфейса — свой у каждой вкладки браузера,
+    чтобы «Стоп» в одной вкладке не трогал расшифровку в другой."""
+    return "ui:" + (getattr(request, "session_hash", None) or "default")
+
+
 _dl_procs: dict[str, subprocess.Popen] = {}  # активные скачивания: модель -> процесс
 
 
@@ -237,7 +242,7 @@ def _collect_sources(uploaded, explorer) -> list[str]:
 
 def transcribe_wrapper(uploaded, explorer, model_choice: str, line_per_segment: bool,
                        diarize: bool = False, num_speakers: float = 0,
-                       progress=gr.Progress()):
+                       request: gr.Request = None, progress=gr.Progress()):
     """
     Батч: каждый файл → отдельный результат. Выдаёт (лог, текст последнего, файлы).
     Цикл по сегментам идёт через генератор сервиса и регулярно возвращает
@@ -268,11 +273,13 @@ def transcribe_wrapper(uploaded, explorer, model_choice: str, line_per_segment: 
     log: list[str] = []
     produced: list[str] = []
     last_text = ""
+    job = _ui_job(request)
     for i, f in enumerate(files, 1):
+        S.discard_job(job)  # остаток прошлой расшифровки этой вкладки «Стоп» сохранять не должен
         log.append(f"⏳ [{i}/{n}] {Path(f).name}")
         yield "\n".join(log), last_text, (produced or None)
         last_tick = 0.0
-        for ev in S.iter_transcribe_file(f, name, line_per_segment, job_id=UI_JOB,
+        for ev in S.iter_transcribe_file(f, name, line_per_segment, job_id=job,
                                          diarize=bool(diarize), num_speakers=int(num_speakers or 0)):
             if ev[0] == "progress":
                 now = time.time()
@@ -287,6 +294,11 @@ def transcribe_wrapper(uploaded, explorer, model_choice: str, line_per_segment: 
                 r = ev[1]
                 log[-1] = (f"✅ [{i}/{n}] {Path(f).name} — {r['segments']} фрагм., "
                            f"{r.get('duration') or 0:.0f} сек → {Path(r['txt']).parent.name}/")
+                if r.get("failure"):
+                    log[-1] = (f"⚠ [{i}/{n}] {Path(f).name} — прервано ошибкой, сохранено распознанное "
+                               f"({r['covered']:.0f} сек) → {Path(r['txt']).parent.name}/: {r['failure']}")
+                if r.get("repair_error"):
+                    log.append(f"   ⚠ {r['repair_error']}")
                 if r.get("speakers"):
                     log.append(f"   говорящих: {len(r['speakers'])}")
                 if r.get("diarization_error"):
@@ -306,13 +318,13 @@ def transcribe_wrapper(uploaded, explorer, model_choice: str, line_per_segment: 
     yield "\n".join(log), last_text, (produced or None)
 
 
-def stop_transcribe_ui():
+def stop_transcribe_ui(request: gr.Request = None):
     """
     «Стоп» распознавания: прервать скачивание (если шло), сохранить уже
     распознанное как частичный результат и вернуть кнопки.
     """
     _kill_downloads()
-    r = S.stop_job(UI_JOB)
+    r = S.stop_job(_ui_job(request))
     if r and r.get("ok"):
         dur = r.get("duration")
         total = f"/{dur:.0f}" if dur else ""
