@@ -21,19 +21,26 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Библиотеки CUDA и сборка sherpa-onnx с поддержкой GPU ставятся из локальной
-# папки wheels/ (в git не входит): пять пакетов NVIDIA с PyPI и wheel sherpa-onnx
-# для CUDA 12 / cuDNN 9. Как её наполнить — раздел «Подготовка к сборке образа»
-# в README. Драйвер приходит с хоста через проброс GPU в контейнер.
-COPY wheels/ /tmp/wheels/
-RUN pip install --no-cache-dir --no-index --find-links /tmp/wheels \
-    nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70 \
-    nvidia-nvjitlink-cu12==12.4.127 \
-    && pip uninstall -y sherpa-onnx sherpa-onnx-core \
-    && pip install --no-cache-dir --no-deps --no-index --find-links /tmp/wheels \
-       nvidia-curand-cu12==10.3.5.147 nvidia-cuda-runtime-cu12==12.8.90 \
-       'sherpa-onnx==1.13.8+cuda12.cudnn9.onnxruntime1.28.2' \
-    && rm -rf /tmp/wheels
+# Библиотеки CUDA и сборка sherpa-onnx с поддержкой GPU (CUDA 12 / cuDNN 9).
+# По умолчанию скачиваются при сборке: пакеты NVIDIA с PyPI, sherpa-onnx — со
+# страницы сборок проекта. Если в папке wheels/ рядом с Dockerfile лежат готовые
+# .whl (все шесть), берутся они, без сети — см. README. Драйвер приходит с хоста
+# через проброс GPU в контейнер.
+COPY requirements.txt wheel[s] /tmp/wheels/
+RUN set -e; \
+    if ls /tmp/wheels/*.whl >/dev/null 2>&1; then \
+        SRC="--no-index --find-links /tmp/wheels"; \
+    else \
+        SRC="--find-links https://k2-fsa.github.io/sherpa/onnx/cuda.html"; \
+    fi; \
+    pip install --no-cache-dir $SRC \
+        nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70 \
+        nvidia-nvjitlink-cu12==12.4.127; \
+    pip uninstall -y sherpa-onnx sherpa-onnx-core; \
+    pip install --no-cache-dir --no-deps $SRC \
+        nvidia-curand-cu12==10.3.5.147 nvidia-cuda-runtime-cu12==12.8.90 \
+        'sherpa-onnx==1.13.8+cuda12.cudnn9.onnxruntime1.28.2'; \
+    rm -rf /tmp/wheels
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/site-packages/nvidia/curand/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.11/site-packages/nvidia/nvjitlink/lib
 
 # Приложение
