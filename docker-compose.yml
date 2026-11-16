@@ -1,5 +1,6 @@
 services:
   calls-recognize:
+    image: calls-recognize:diarization-titanet-20261116
     build: .
     container_name: calls-recognize
     ports:
@@ -12,13 +13,20 @@ services:
       # Кеш модели Whisper (чтобы не качать при пересборке)
       - whisper_cache:/app/whisper
     environment:
-      - WHISPER_MODEL=small        # tiny/base/small/medium/large-v3 (точность vs скорость)
+      - WHISPER_MODEL=large-v3-turbo   # tiny/base/small/medium/large-v3/large-v3-turbo (точность vs скорость)
       - WHISPER_DEVICE=auto        # auto: GPU если есть CUDA, иначе CPU | cuda | cpu
       - WHISPER_BEAM_SIZE=5        # 5 — точнее; 1–2 — быстрее
       # - WHISPER_COMPUTE_TYPE=    # пусто = float16 на GPU / int8 на CPU
       # - WHISPER_CPU_THREADS=     # пусто = все ядра
       - WHISPER_LANGUAGE=ru        # ru или auto для автоопределения
       - WHISPER_DOWNLOAD_ROOT=/app/whisper
+      - WHISPER_HALLUCINATION_SILENCE=2   # пропускать тишину длиннее 2 с (защита от выдуманных фраз); 0 — выкл.
+      - DIARIZATION_DIR=/app/whisper/diarization   # модели разделения по говорящим (качаются при первом запуске)
+      - DIARIZATION_PROVIDER=cuda   # segmentation and voice embeddings on NVIDIA GPU
+      - DIARIZATION_NUM_THREADS=2   # bounded CPU helper threads
+      - DIARIZATION_THRESHOLD=0.5  # больше — меньше говорящих при автоподборе
+      - DIARIZATION_MERGE_THRESHOLD=0.6  # склейка кластеров одного голоса по отпечатку (TitaNet); ниже 0.6 слипаются разные люди; 0 — выкл.
+      - TZ=Europe/Moscow          # время в meta.json и интерфейсе
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7861
       # Токен HF ускоряет скачивание моделей (убирает троттлинг анонимов).

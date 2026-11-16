@@ -44,6 +44,27 @@ WHISPER_CPU_THREADS = int(os.environ.get("WHISPER_CPU_THREADS", "0") or 0) or (o
 # Ширина beam search: 5 — точнее, 1–2 — заметно быстрее.
 WHISPER_BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5") or 5)
 
+# Пропуск «галлюцинаций» на тишине: участки без речи длиннее порога (сек)
+# не отдаются модели на додумывание. 0 — выключено.
+WHISPER_HALLUCINATION_SILENCE = float(os.environ.get("WHISPER_HALLUCINATION_SILENCE", "2") or 0)
+
+# Фразы, которые Whisper выдумывает на тишине и шуме (русские субтитры из обучающих данных).
+HALLUCINATION_RE = re.compile(
+    r"продолжение следует|субтитры (сделал|создавал|делал)|редактор субтитров|"
+    r"спасибо за просмотр|подписывайтесь на (наш )?канал|ставьте лайк|dimatorzok",
+    re.IGNORECASE,
+)
+
+# Признак потерянной речи: сегмент длиннее LOST_MIN_SEC, в котором меньше
+# LOST_MAX_WPS слов в секунду (обычная речь — 2–3 слова в секунду).
+LOST_MIN_SEC = 12.0
+LOST_MAX_WPS = 0.6
+
+# Второй признак: пропуск между сегментами длиннее GAP_MIN_SEC, в котором
+# детектор речи (VAD) слышит речь хотя бы GAP_MIN_SPEECH от длины пропуска.
+GAP_MIN_SEC = 5.0
+GAP_MIN_SPEECH = 0.5
+
 # Разрешённая среда выполнения (заполняется лениво при первом обращении).
 _runtime: dict | None = None
 
@@ -395,6 +416,29 @@ def set_enabled_models(names: list[str]) -> tuple[bool, str]:
     return True, f"[OK]Доступные модели: {', '.join(valid)}."
 
 
+def get_terms() -> list[str]:
+    """Словарь терминов-подсказок для распознавания (названия продуктов, имена, аббревиатуры)."""
+    return [t for t in (load_settings().get("terms") or []) if isinstance(t, str) and t.strip()]
+
+
+def set_terms(terms: list[str]) -> tuple[bool, str]:
+    """Сохраняет словарь терминов. Пустой список — подсказки выключены."""
+    clean = list(dict.fromkeys(t.strip() for t in (terms or []) if t and t.strip()))
+    s = load_settings()
+    s["terms"] = clean
+    save_settings(s)
+    return True, f"[OK]Терминов в словаре: {len(clean)}."
+
+
+def hotwords_text(terms: list[str] | None = None) -> str | None:
+    """
+    Строка подсказок для Whisper (параметр hotwords — подмешивается в каждое окно
+    распознавания). Модель берёт не больше ~220 токенов, лишнее отрежется.
+    """
+    t = get_terms() if terms is None else terms
+    return ", ".join(t) if t else None
+
+
 def model_info_row(model_name: str, check_remote: bool = False) -> dict:
     """Сводка по модели для таблицы/API."""
     b = cached_model_bin(model_name)
@@ -524,7 +568,7 @@ def read_transcript(txt_path: str | Path) -> tuple[str, list[str]]:
     return text, files
 
 
-def open_segments(file_path: str, model_name: str | None = None):
+def open_segments(file_path: str, model_name: str | None = None, hotwords: str | None = None):
     """
     Готовит модель и запускает распознавание. Возвращает (segments, info, name)
     либо (None, None, error_text). segments — ленивый генератор faster-whisper:
@@ -543,28 +587,173 @@ def open_segments(file_path: str, model_name: str | None = None):
     except Exception as e:  # noqa: BLE001
         return None, None, f"[ERROR]Не удалось загрузить модель «{name}»: {str(e)}"
 
-    language = WHISPER_LANGUAGE.strip().lower()
-    if language in ("", "auto"):
-        language = None
     try:
-        segments, info = model.transcribe(
-            str(path), language=language, beam_size=WHISPER_BEAM_SIZE, vad_filter=True,
-        )
+        segments, info = model.transcribe(str(path), **transcribe_kwargs(hotwords))
     except Exception as e:  # noqa: BLE001
         return None, None, f"[ERROR]Ошибка расшифровки: {str(e)}"
     return segments, info, name
 
 
-def save_transcription(
-    file_path: str,
-    timed_segments: list[tuple[float, float, str]],
-    line_per_segment: bool = False,
-) -> str:
-    """Сохраняет .txt и .srt, возвращает итоговый текст."""
-    sep = "\n" if line_per_segment else " "
-    text = sep.join(t for _, _, t in timed_segments)
-    _save_transcript(Path(file_path), text)
-    _save_srt(Path(file_path), timed_segments)
+def transcribe_kwargs(hotwords: str | None = None, vad: bool = True) -> dict:
+    """
+    Общие параметры распознавания.
+    condition_on_previous_text=False — ошибка одного окна не тянется в следующие
+    (главный источник зацикливаний и «проглоченных» кусков на длинных записях).
+    word_timestamps нужны для hallucination_silence_threshold и для разметки говорящих.
+    """
+    language = WHISPER_LANGUAGE.strip().lower()
+    kw = {
+        "language": None if language in ("", "auto") else language,
+        "beam_size": WHISPER_BEAM_SIZE,
+        "vad_filter": vad,
+        "condition_on_previous_text": False,
+        "word_timestamps": True,
+        "hotwords": hotwords or None,
+    }
+    if WHISPER_HALLUCINATION_SILENCE > 0:
+        kw["hallucination_silence_threshold"] = WHISPER_HALLUCINATION_SILENCE
+    return kw
+
+
+def segment_dict(seg, offset: float = 0.0) -> dict | None:
+    """Сегмент faster-whisper → {start, end, text, words:[(start, end, word)]}; None, если пустой."""
+    text = (seg.text or "").strip()
+    if not text:
+        return None
+    words = [(w.start + offset, w.end + offset, w.word) for w in (seg.words or [])]
+    return {"start": seg.start + offset, "end": seg.end + offset, "text": text, "words": words}
+
+
+def is_hallucination(seg: dict, prev: dict | None) -> bool:
+    """
+    Выдуманная фраза: известный шаблон («Продолжение следует...») или та же
+    реплика, что и предыдущая, повторённая за доли секунды («Прошу вас.» ×4).
+    """
+    if HALLUCINATION_RE.search(seg["text"]):
+        return True
+    return bool(
+        prev and seg["text"] == prev["text"]
+        and seg["end"] - seg["start"] < 1.0 and seg["start"] - prev["end"] < 1.0
+    )
+
+
+def is_lost_speech(seg: dict) -> bool:
+    """Длинный сегмент почти без слов — Whisper «проглотил» речь."""
+    dur = seg["end"] - seg["start"]
+    return dur >= LOST_MIN_SEC and len(seg["text"].split()) / dur < LOST_MAX_WPS
+
+
+def load_audio(file_path: str):
+    """Звуковая дорожка как float32 16 кГц моно (тот же декодер, что у faster-whisper)."""
+    from faster_whisper.audio import decode_audio
+    return decode_audio(str(file_path), sampling_rate=16000)
+
+
+def speech_share(audio, start: float, end: float) -> float:
+    """Доля интервала [start, end], в которой детектор речи (Silero VAD) слышит речь."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    sr = 16000
+    chunk = audio[int(start * sr):int(end * sr)]
+    if len(chunk) == 0:
+        return 0.0
+    ts = get_speech_timestamps(chunk, VadOptions())
+    return sum(t["end"] - t["start"] for t in ts) / len(chunk)
+
+
+def find_gaps(segs: list[dict], duration: float | None) -> list[tuple[float, float]]:
+    """Пропуски без текста длиннее GAP_MIN_SEC, включая начало и конец записи."""
+    edges = [0.0] + [x for s in segs for x in (s["start"], s["end"])] + [duration or segs[-1]["end"]]
+    return [(edges[i], edges[i + 1]) for i in range(0, len(edges) - 1, 2)
+            if edges[i + 1] - edges[i] >= GAP_MIN_SEC]
+
+
+def retranscribe_range(model_name: str, audio, start: float, end: float,
+                       hotwords: str | None = None) -> list[dict]:
+    """
+    Повторно распознаёт кусок [start, end] без VAD-фильтра, с полем в полсекунды
+    по краям (чтобы не резать слова). Слова, попавшие в поле, отбрасываются —
+    они уже есть в соседних сегментах. Возвращает сегменты с таймкодами всей записи.
+    """
+    sr = 16000
+    a = max(0.0, start - 0.5)
+    b = min(len(audio) / sr, end + 0.5)
+    model = _get_model(model_name)
+    segments, _ = model.transcribe(audio[int(a * sr):int(b * sr)], **transcribe_kwargs(hotwords, vad=False))
+    out = []
+    for seg in segments:
+        d = segment_dict(seg, offset=a)
+        if not d:
+            continue
+        if d["words"]:
+            words = [w for w in d["words"] if start <= (w[0] + w[1]) / 2 <= end]
+            if not words:
+                continue
+            d = {"start": words[0][0], "end": words[-1][1],
+                 "text": "".join(w[2] for w in words).strip(), "words": words}
+        if d["text"] and not is_hallucination(d, out[-1] if out else None):
+            out.append(d)
+    return out
+
+
+def recording_time(file_path: str) -> str | None:
+    """
+    Время начала записи из метаданных контейнера (creation_time), в местном
+    часовом поясе сервиса (TZ). None, если в файле его нет.
+    """
+    from datetime import datetime
+    try:
+        import av
+        with av.open(str(file_path)) as c:
+            raw = c.metadata.get("creation_time")
+        if not raw:
+            return None
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return None
+
+
+def unique_output_txt(source_path: str | Path) -> Path:
+    """
+    Путь к .txt для новой расшифровки, не затирающий прошлые:
+    output/<имя>/<имя>.txt, а если папка занята — output/<имя> (2)/<имя> (2).txt и т.д.
+    """
+    base = transcript_path_for(source_path)
+    if not base.parent.exists():
+        return base
+    stem = base.parent.name
+    n = 2
+    while (OUTPUT_DIR / f"{stem} ({n})").exists():
+        n += 1
+    name = f"{stem} ({n})"
+    return OUTPUT_DIR / name / f"{name}.txt"
+
+
+def write_outputs(txt_path: Path, utterances: list[dict], line_per_segment: bool = False) -> str:
+    """
+    Сохраняет .txt и .srt из реплик {start, end, text, speaker?}, возвращает текст.
+    С говорящими текст всегда разбит на реплики «Говорящий N: …»
+    (подряд идущие реплики одного говорящего склеиваются, если не просили «каждую с новой строки»).
+    """
+    txt_path.parent.mkdir(parents=True, exist_ok=True)
+    has_speakers = any(u.get("speaker") for u in utterances)
+    if has_speakers:
+        lines: list[list] = []
+        for u in utterances:
+            if lines and not line_per_segment and lines[-1][0] == u.get("speaker"):
+                lines[-1][1] += " " + u["text"]
+            else:
+                lines.append([u.get("speaker"), u["text"]])
+        text = "\n".join(f"{s}: {t}" if s else t for s, t in lines)
+    else:
+        text = ("\n" if line_per_segment else " ").join(u["text"] for u in utterances)
+    txt_path.write_text(text, encoding="utf-8")
+
+    srt_rows = [
+        (u["start"], u["end"], f"[{u['speaker']}] {u['text']}" if u.get("speaker") else u["text"])
+        for u in utterances
+    ]
+    txt_path.with_suffix(".srt").write_text(_build_srt(srt_rows), encoding="utf-8")
     return text
 
 
@@ -605,16 +794,7 @@ def transcribe_media(
         return None, f"[ERROR]Не удалось загрузить модель Whisper: {str(e)}"
 
     try:
-        language = WHISPER_LANGUAGE.strip().lower()
-        if language in ("", "auto"):
-            language = None
-
-        segments, info = model.transcribe(
-            str(path),
-            language=language,
-            beam_size=WHISPER_BEAM_SIZE,
-            vad_filter=True,  # отсекаем тишину/паузы — точнее на созвонах
-        )
+        segments, info = model.transcribe(str(path), **transcribe_kwargs(hotwords_text()))
 
         detected = getattr(info, "language", None)
         if detected:

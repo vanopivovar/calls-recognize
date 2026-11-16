@@ -236,6 +236,7 @@ def _collect_sources(uploaded, explorer) -> list[str]:
 
 
 def transcribe_wrapper(uploaded, explorer, model_choice: str, line_per_segment: bool,
+                       diarize: bool = False, num_speakers: float = 0,
                        progress=gr.Progress()):
     """
     Батч: каждый файл → отдельный результат. Выдаёт (лог, текст последнего, файлы).
@@ -271,7 +272,8 @@ def transcribe_wrapper(uploaded, explorer, model_choice: str, line_per_segment: 
         log.append(f"⏳ [{i}/{n}] {Path(f).name}")
         yield "\n".join(log), last_text, (produced or None)
         last_tick = 0.0
-        for ev in S.iter_transcribe_file(f, name, line_per_segment, job_id=UI_JOB):
+        for ev in S.iter_transcribe_file(f, name, line_per_segment, job_id=UI_JOB,
+                                         diarize=bool(diarize), num_speakers=int(num_speakers or 0)):
             if ev[0] == "progress":
                 now = time.time()
                 if now - last_tick >= 0.5:  # точка отмены + обновление не чаще 2 раз/с
@@ -284,7 +286,17 @@ def transcribe_wrapper(uploaded, explorer, model_choice: str, line_per_segment: 
             elif ev[0] == "done":
                 r = ev[1]
                 log[-1] = (f"✅ [{i}/{n}] {Path(f).name} — {r['segments']} фрагм., "
-                           f"{r.get('duration') or 0:.0f} сек")
+                           f"{r.get('duration') or 0:.0f} сек → {Path(r['txt']).parent.name}/")
+                if r.get("speakers"):
+                    log.append(f"   говорящих: {len(r['speakers'])}")
+                if r.get("diarization_error"):
+                    log.append(f"   ⚠ {r['diarization_error']}")
+                if r.get("hallucinations_removed"):
+                    log.append(f"   убрано выдуманных фраз: {len(r['hallucinations_removed'])}")
+                for x in r.get("lost_speech_repaired") or []:
+                    log.append(f"   восстановлен потерянный кусок {x}")
+                for x in r.get("lost_speech_left") or []:
+                    log.append(f"   ⚠ речь потеряна, восстановить не удалось: {x}")
                 produced += [r["txt"], r["srt"]]
                 last_text = r["text"]
         yield "\n".join(log), last_text, (produced or None)
@@ -372,9 +384,46 @@ def set_enabled_models(names: list[str]) -> dict:
     return S.api_set_enabled_models(names)
 
 
-def transcribe(path: str, model: str = "", line_per_segment: bool = False) -> list[dict]:
-    """Расшифровать файл или папку (путь внутри контейнера /app/input/... или относительно input/). Один файл = один результат: txt, srt, text, model, language, duration."""
-    return S.api_transcribe(path, model, line_per_segment)
+def transcribe(path: str, model: str = "", line_per_segment: bool = False,
+               diarize: bool = False, num_speakers: int = 0) -> list[dict]:
+    """Расшифровать файл или папку и дождаться результата (держит соединение — для длинных записей используйте start_transcribe). Путь внутри контейнера /app/input/... или относительно input/. diarize=true — разметить говорящих («Говорящий N»), num_speakers — сколько их (0 — определить самому). Один файл = один результат: txt, srt, text, meta."""
+    return S.api_transcribe(path, model, line_per_segment, diarize, num_speakers)
+
+
+def start_transcribe(path: str, model: str = "", line_per_segment: bool = True,
+                     diarize: bool = False, num_speakers: int = 0) -> dict:
+    """Поставить расшифровку файла или папки в очередь и сразу вернуть job_id. Ход и результат — через job_status(job_id). Параметры как у transcribe."""
+    return S.api_start_transcribe(path, model, line_per_segment, diarize, num_speakers)
+
+
+def job_status(job_id: str) -> dict:
+    """Состояние задачи из start_transcribe: status (queued/running/done/error/cancelled), progress 0–1, desc, results (пути к txt/srt и meta, без текста)."""
+    return S.job_status(job_id)
+
+
+def cancel_job(job_id: str) -> dict:
+    """Остановить задачу: распознанное в текущем файле сохранится как частичный результат."""
+    return S.cancel_job(job_id)
+
+
+def list_jobs() -> list[dict]:
+    """Все задачи с момента запуска сервиса, свежие первыми."""
+    return S.list_jobs()
+
+
+def get_terms() -> dict:
+    """Словарь терминов-подсказок, который подмешивается в распознавание (названия продуктов, имена, аббревиатуры)."""
+    return S.api_get_terms()
+
+
+def set_terms(terms: list[str]) -> dict:
+    """Заменить словарь терминов-подсказок целиком. Пустой список — подсказки выключены."""
+    return S.api_set_terms(terms)
+
+
+def save_terms_ui(text: str) -> str:
+    r = S.api_set_terms([t for t in (text or "").splitlines()])
+    return ("✅ " if r["ok"] else "❌ ") + r["message"]
 
 
 def list_transcripts() -> list[dict]:
@@ -461,6 +510,15 @@ def create_app() -> gr.Blocks:
                                 label="Каждая реплика с новой строки", value=False,
                             )
                             with gr.Row():
+                                diarize_cb = gr.Checkbox(
+                                    label="Разделять по говорящим", value=False, scale=2,
+                                    info="«Говорящий 1», «Говорящий 2»… Первый запуск скачает модели (~30 МБ).",
+                                )
+                                num_speakers_nb = gr.Number(
+                                    label="Сколько говорящих", value=0, precision=0, minimum=0,
+                                    maximum=20, scale=1, info="0 — определить самому",
+                                )
+                            with gr.Row():
                                 transcribe_btn = gr.Button(
                                     "Расшифровать", variant="primary", scale=3, interactive=False
                                 )
@@ -493,6 +551,20 @@ def create_app() -> gr.Blocks:
                                 label="Файлы: .txt и .srt (все обработанные)",
                                 file_count="multiple",
                             )
+
+                with gr.Accordion("Словарь терминов", open=False):
+                    gr.Markdown(
+                        "<sub>Названия продуктов, систем, имена — по одному в строке. Подсказываются "
+                        "модели при распознавании, чтобы она писала их правильно. Длинный список "
+                        "(больше ~150 слов) обрежется.</sub>"
+                    )
+                    terms_tb = gr.Textbox(
+                        value="\n".join(S.api_get_terms()["terms"]),
+                        lines=8, show_label=False,
+                        placeholder="Kubernetes\nPostgreSQL\nИванов",
+                    )
+                    save_terms_btn = gr.Button("Сохранить словарь")
+                    terms_status = gr.Textbox(show_label=False, interactive=False)
 
                 with gr.Accordion("Прошлые расшифровки", open=True):
                     with gr.Row():
@@ -547,8 +619,10 @@ def create_app() -> gr.Blocks:
                     "### Подключение ИИ-агента (MCP)\n"
                     "Сервис публикует MCP-сервер по адресу **`/gradio_api/mcp/sse`** "
                     "(например `http://localhost:7861/gradio_api/mcp/sse`).\n\n"
-                    "Инструменты: `list_models`, `download_model`, `delete_model`, "
-                    "`set_enabled_models`, `transcribe`, `list_transcripts`, `read_transcript`.\n\n"
+                    "Инструменты: `start_transcribe` → `job_status` / `cancel_job` / `list_jobs` "
+                    "(фоновая расшифровка), `transcribe` (с ожиданием результата), "
+                    "`list_transcripts`, `read_transcript`, `get_terms` / `set_terms` (словарь терминов), "
+                    "`list_models`, `download_model`, `delete_model`, `set_enabled_models`, `runtime`.\n\n"
                     "**Клиент с поддержкой SSE:** укажите этот адрес как MCP-сервер.\n\n"
                     "**Клиент, запускающий MCP-серверы командой** (через `mcp-remote`):\n"
                     "```json\n{ \"mcpServers\": { \"calls-recognize\": {\n"
@@ -622,7 +696,7 @@ def create_app() -> gr.Blocks:
             fn=_show_stop, outputs=[transcribe_btn, stop_transcribe_btn], api_name=False,
         ).then(
             fn=transcribe_wrapper,
-            inputs=[media_input, explorer, model_dd, line_per_segment_cb],
+            inputs=[media_input, explorer, model_dd, line_per_segment_cb, diarize_cb, num_speakers_nb],
             outputs=[transcribe_status, transcript_text, transcript_files],
             show_progress_on=[transcribe_status], concurrency_limit=1, api_name=False,
         )
@@ -642,6 +716,8 @@ def create_app() -> gr.Blocks:
         history_dd.change(fn=open_transcript, inputs=[history_dd],
                           outputs=[transcript_text, transcript_files], api_name=False)
         refresh_btn.click(fn=refresh_history, outputs=[history_dd], api_name=False)
+        save_terms_btn.click(fn=save_terms_ui, inputs=[terms_tb], outputs=[terms_status],
+                             api_name=False)
 
         # Загрузка страницы
         app.load(fn=load_initial, outputs=[history_dd, transcript_text, transcript_files],
@@ -658,6 +734,12 @@ def create_app() -> gr.Blocks:
         gr.api(delete_model, api_name="delete_model")
         gr.api(set_enabled_models, api_name="set_enabled_models")
         gr.api(transcribe, api_name="transcribe")
+        gr.api(start_transcribe, api_name="start_transcribe")
+        gr.api(job_status, api_name="job_status")
+        gr.api(cancel_job, api_name="cancel_job")
+        gr.api(list_jobs, api_name="list_jobs")
+        gr.api(get_terms, api_name="get_terms")
+        gr.api(set_terms, api_name="set_terms")
         gr.api(list_transcripts, api_name="list_transcripts")
         gr.api(read_transcript, api_name="read_transcript")
         gr.api(runtime, api_name="runtime")

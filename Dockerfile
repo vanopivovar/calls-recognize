@@ -32,13 +32,18 @@ COPY wheels/ /tmp/wheels/
 RUN pip install --no-cache-dir --no-index --find-links /tmp/wheels \
     nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70 \
     nvidia-nvjitlink-cu12==12.4.127 \
+    && pip uninstall -y sherpa-onnx sherpa-onnx-core \
+    && pip install --no-cache-dir --no-deps --no-index --find-links /tmp/wheels \
+       nvidia-curand-cu12==10.3.5.147 nvidia-cuda-runtime-cu12==12.8.90 \
+       'sherpa-onnx==1.13.8+cuda12.cudnn9.onnxruntime1.28.2' \
     && rm -rf /tmp/wheels
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.11/site-packages/nvidia/curand/lib:/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.11/site-packages/nvidia/nvjitlink/lib
 
 # Приложение
 COPY config.py .
 COPY transcriber.py .
 COPY service.py .
+COPY diarizer.py .
 COPY ui.py .
 COPY app.py .
 
@@ -48,11 +53,15 @@ ENV INPUT_DIR=/app/input
 ENV OUTPUT_DIR=/app/output
 
 # Переменные окружения
-ENV WHISPER_MODEL=small
+ENV WHISPER_MODEL=large-v3-turbo
 ENV WHISPER_DEVICE=auto
 ENV WHISPER_BEAM_SIZE=5
 ENV WHISPER_LANGUAGE=ru
 ENV WHISPER_DOWNLOAD_ROOT=/app/whisper
+ENV DIARIZATION_DIR=/app/whisper/diarization
+ENV DIARIZATION_PROVIDER=cuda DIARIZATION_NUM_THREADS=2
+# Время в meta.json и интерфейсе — по Москве
+ENV TZ=Europe/Moscow
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV GRADIO_SERVER_PORT=7861
 

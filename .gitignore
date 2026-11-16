@@ -19,6 +19,9 @@ build.log
 # CUDA wheels для сборки образа (качаются на хост, ~1 ГБ — в git не нужны)
 wheels/
 
+# Локальные копии файлов перед правками
+backups/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -5,7 +5,11 @@
 Все функции возвращают простые JSON-совместимые словари/списки.
 """
 
+import json
+import queue
+import threading
 import time
+import uuid
 from pathlib import Path
 
 import transcriber as T
@@ -59,27 +63,43 @@ _jobs: dict[str, dict] = {}
 
 
 def _finalize(state: dict, partial: bool) -> dict:
-    """Сохраняет .txt/.srt/meta.json из накопленных сегментов и возвращает результат."""
+    """Сохраняет .txt/.srt/meta.json из накопленных реплик и возвращает результат."""
     p = Path(state["path"])
-    timed = list(state["timed"])
-    text = T.save_transcription(str(p), timed, state["lps"])
-    txt = T.transcript_path_for(p)
-    srt = txt.with_suffix(".srt")
+    utterances = state.get("utterances") or [
+        {"start": s["start"], "end": s["end"], "text": s["text"]} for s in state["segs"]
+    ]
+    txt = Path(state["txt"])
+    text = T.write_outputs(txt, utterances, state["lps"])
     duration = state.get("duration")
-    covered = round(timed[-1][1], 1) if timed else 0.0
+    covered = round(max(u["end"] for u in utterances), 1) if utterances else 0.0
+    speakers = sorted({u["speaker"] for u in utterances if u.get("speaker")})
     meta_row = {
         "source": str(p),
         "model": state["model"],
         "language": state.get("language"),
         "duration": round(duration, 1) if duration else None,
         "covered": covered,
-        "segments": len(timed),
+        "segments": len(utterances),
         "partial": bool(partial),
         "line_per_segment": bool(state["lps"]),
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "recorded": T.recording_time(str(p)),
+        "terms": len(state.get("terms") or []),
+        "hallucinations_removed": state.get("removed", []),
+        "lost_speech_repaired": state.get("repaired", []),
+        "lost_speech_left": state.get("lost_left", []),
+        "speakers": speakers,
+        "diarization_error": state.get("diar_error"),
+        "diarization_runtime": state.get("diar_runtime"),
     }
-    T.write_manifest(p, meta_row)
-    return {"ok": True, "txt": str(txt), "srt": str(srt), "text": text, **meta_row}
+    mp = txt.parent / "meta.json"
+    mp.write_text(json.dumps(meta_row, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "txt": str(txt), "srt": str(txt.with_suffix(".srt")), "text": text, **meta_row}
+
+
+def _hms(sec: float) -> str:
+    sec = int(sec)
+    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
 
 
 def iter_transcribe_file(
@@ -87,12 +107,16 @@ def iter_transcribe_file(
     model: str | None = None,
     line_per_segment: bool = False,
     job_id: str | None = None,
+    diarize: bool = False,
+    num_speakers: int = 0,
 ):
     """
     Генератор расшифровки ОДНОГО файла. Выдаёт:
-      ("progress", fraction, desc)  — по ходу распознавания,
+      ("progress", fraction, desc)  — по ходу работы,
       ("error", message)            — при ошибке,
       ("done", result_dict)         — в конце (файлы сохранены).
+    Этапы: распознавание → отсев галлюцинаций → повторное распознавание
+    кусков с потерянной речью → (по запросу) разметка говорящих → сохранение.
     Цикл по сегментам живёт здесь, поэтому вызывающая сторона может
     прервать его (перестать итерироваться) — и Whisper остановится.
     Если задан job_id, состояние доступно stop_job() для частичного сохранения.
@@ -113,30 +137,88 @@ def iter_transcribe_file(
         except Exception as e:  # noqa: BLE001
             yield ("error", f"Не удалось скачать модель: {e}"); return
 
-    segments, info, meta = T.open_segments(str(p), name)
+    terms = T.get_terms()
+    hotwords = T.hotwords_text(terms)
+    segments, info, meta = T.open_segments(str(p), name, hotwords)
     if segments is None:
         yield ("error", str(meta)); return
 
     duration = getattr(info, "duration", None)
     state = {
         "path": str(p), "model": name, "lps": bool(line_per_segment),
-        "timed": [], "duration": duration, "language": getattr(info, "language", None),
+        "txt": str(T.unique_output_txt(p)), "terms": terms,
+        "segs": [], "removed": [], "duration": duration,
+        "language": getattr(info, "language", None),
     }
     if job_id:
         _jobs[job_id] = state
 
+    # Доля прогресса на распознавание; остальное — на повтор потерь и говорящих.
+    asr_share = 0.75 if diarize else 0.9
     completed = False
     try:
+        prev = None
         for seg in segments:
-            text = (seg.text or "").strip()
-            if text:
-                state["timed"].append((seg.start, seg.end, text))
+            d = T.segment_dict(seg)
+            if d:
+                if T.is_hallucination(d, prev):
+                    state["removed"].append(f"{_hms(d['start'])} {d['text']}")
+                else:
+                    state["segs"].append(d)
+                    prev = d
             if duration:
-                frac = min((seg.end or 0.0) / duration, 0.99)
+                frac = min((seg.end or 0.0) / duration, 0.99) * asr_share
                 yield ("progress", frac, f"{seg.end:.0f}/{duration:.0f} сек")
-        if not state["timed"]:
+        if not state["segs"]:
             completed = True
             yield ("error", "Речь не распознана (тишина / нет дорожки)."); return
+
+        # Потерянная речь двух видов, оба куска перераспознаём отдельно, без VAD:
+        #  • сегмент почти без слов (Whisper «проглотил» речь внутри окна);
+        #  • пропуск между сегментами, где детектор речи слышит речь.
+        yield ("progress", asr_share, "ищу потерянную речь")
+        audio = T.load_audio(str(p))
+        state["repaired"], state["lost_left"] = [], []
+        lost = [i for i, s in enumerate(state["segs"]) if T.is_lost_speech(s)]
+        for k, i in enumerate(reversed(lost), 1):
+            old = state["segs"][i]
+            yield ("progress", asr_share, f"повтор потерянного куска {k}/{len(lost)} ({_hms(old['start'])})")
+            new = T.retranscribe_range(name, audio, old["start"], old["end"], hotwords)
+            old_words = len(old["text"].split())
+            new_words = sum(len(s["text"].split()) for s in new)
+            span = f"{_hms(old['start'])}–{_hms(old['end'])}"
+            if new_words > old_words * 1.5 and new_words - old_words >= 5:
+                state["segs"][i:i + 1] = new
+                state["repaired"].append(f"{span}: было слов {old_words}, стало {new_words}")
+            else:
+                state["lost_left"].append(f"{span}: {old['text']}")
+
+        gaps = [g for g in T.find_gaps(state["segs"], duration)
+                if T.speech_share(audio, *g) >= T.GAP_MIN_SPEECH]
+        for k, (a, b) in enumerate(gaps, 1):
+            yield ("progress", asr_share, f"повтор пропуска {k}/{len(gaps)} ({_hms(a)})")
+            new = T.retranscribe_range(name, audio, a, b, hotwords)
+            new_words = sum(len(s["text"].split()) for s in new)
+            span = f"{_hms(a)}–{_hms(b)}"
+            if new_words >= 3:
+                state["segs"].extend(new)
+                state["repaired"].append(f"{span}: пропуск, восстановлено слов {new_words}")
+            else:
+                state["lost_left"].append(f"{span}: пропуск, речь слышна, но не распознана")
+        state["segs"].sort(key=lambda s: s["start"])
+        state["repaired"].sort()
+        state["lost_left"].sort()
+
+        if diarize:
+            try:
+                import diarizer as D
+                yield ("progress", asr_share, "разделяю по говорящим")
+                turns = D.diarize(audio, num_speakers)
+                state["diar_runtime"] = D.runtime_info()
+                state["utterances"] = D.assign_speakers(state["segs"], turns)
+            except Exception as e:  # noqa: BLE001
+                state["diar_error"] = f"Не удалось разделить по говорящим: {e}"
+
         result = _finalize(state, partial=False)
         completed = True
         yield ("done", result)
@@ -155,7 +237,7 @@ def stop_job(job_id: str) -> dict | None:
     state = _jobs.pop(job_id, None)
     if not state:
         return None
-    if not state["timed"]:
+    if not state["segs"]:
         return {"ok": False, "source": state["path"], "error": "Ничего не успело распознаться."}
     return _finalize(state, partial=True)
 
@@ -165,12 +247,15 @@ def transcribe_file(
     model: str | None = None,
     line_per_segment: bool = False,
     progress_callback=None,
+    diarize: bool = False,
+    num_speakers: int = 0,
 ) -> dict:
     """
     Расшифровать ОДИН файл → один результат (.txt + .srt + meta.json).
     Блокирующая обёртка над iter_transcribe_file (для MCP/API).
     """
-    for ev in iter_transcribe_file(path, model, line_per_segment):
+    for ev in iter_transcribe_file(path, model, line_per_segment,
+                                   diarize=diarize, num_speakers=num_speakers):
         if ev[0] == "progress":
             if progress_callback:
                 try:
@@ -184,19 +269,27 @@ def transcribe_file(
     return {"ok": False, "source": str(path), "error": "Расшифровка прервана."}
 
 
+def _resolve(path: str) -> Path:
+    """Относительный путь ищется в INPUT_DIR."""
+    p = Path(path)
+    if not p.is_absolute() and not p.exists():
+        p = INPUT_DIR / p
+    return p
+
+
 def transcribe_path(
     path: str,
     model: str | None = None,
     line_per_segment: bool = False,
     progress_callback=None,
+    diarize: bool = False,
+    num_speakers: int = 0,
 ) -> list[dict]:
     """
     Расшифровать файл ИЛИ папку (рекурсивно). Один файл = один результат.
     Относительный путь ищется в INPUT_DIR.
     """
-    p = Path(path)
-    if not p.is_absolute() and not p.exists():
-        p = INPUT_DIR / p
+    p = _resolve(path)
     files = T.iter_media_files(p)
     if not files:
         return [{"ok": False, "source": str(p), "error": "Нет видео/аудио по этому пути."}]
@@ -207,8 +300,113 @@ def transcribe_path(
         def cb(frac, desc, _i=i):
             if progress_callback:
                 progress_callback((_i + frac) / n, f"[{_i + 1}/{n}] {desc}")
-        results.append(transcribe_file(str(f), model, line_per_segment, cb))
+        results.append(transcribe_file(str(f), model, line_per_segment, cb, diarize, num_speakers))
     return results
+
+
+# ──────────────────────────────────────────────
+# Фоновые задачи (для MCP/API: запуск не держит соединение)
+# ──────────────────────────────────────────────
+
+_bg_jobs: dict[str, dict] = {}
+_bg_queue: "queue.Queue[str]" = queue.Queue()
+_bg_lock = threading.Lock()
+_bg_worker: threading.Thread | None = None
+
+
+def _public(job: dict) -> dict:
+    """Состояние задачи без полного текста (он большой — читать через read_transcript)."""
+    res = [{k: v for k, v in r.items() if k != "text"} for r in job["results"]]
+    return {k: v for k, v in job.items() if k not in ("results", "cancel", "opts")} | {"results": res}
+
+
+def _run_bg(job: dict) -> None:
+    files, n = job["files"], len(job["files"])
+    job["status"] = "running"
+    job["started"] = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    for i, f in enumerate(files):
+        if job["cancel"]:
+            job["results"].append({"ok": False, "source": f, "error": "Отменено до начала."})
+            continue
+        sub = f"{job['job_id']}:{i}"
+        gen = iter_transcribe_file(f, job_id=sub, **job["opts"])
+        result = None
+        try:
+            for ev in gen:
+                if ev[0] == "progress":
+                    job["progress"] = round((i + ev[1]) / n, 3)
+                    job["desc"] = f"[{i + 1}/{n}] {Path(f).name}: {ev[2]}"
+                elif ev[0] == "error":
+                    result = {"ok": False, "source": f, "error": ev[1]}
+                elif ev[0] == "done":
+                    result = ev[1]
+                if job["cancel"]:
+                    break
+        except Exception as e:  # noqa: BLE001
+            result = {"ok": False, "source": f, "error": str(e)}
+        finally:
+            gen.close()
+        if result is None:  # остановлено на середине — сохраняем распознанное
+            result = stop_job(sub) or {"ok": False, "source": f, "error": "Остановлено."}
+        job["results"].append(result)
+    job["progress"] = 1.0
+    job["status"] = "cancelled" if job["cancel"] else (
+        "done" if any(r.get("ok") for r in job["results"]) else "error")
+    job["finished"] = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _worker_loop() -> None:
+    # Задачи идут строго по одной: GPU одна, параллельные расшифровки только мешают.
+    while True:
+        jid = _bg_queue.get()
+        job = _bg_jobs.get(jid)
+        if job:
+            try:
+                _run_bg(job)
+            except Exception as e:  # noqa: BLE001
+                job["status"], job["error"] = "error", str(e)
+
+
+def start_job(path: str, model: str | None = None, line_per_segment: bool = True,
+              diarize: bool = False, num_speakers: int = 0) -> dict:
+    """Ставит расшифровку файла или папки в очередь. Возвращает {job_id, status, files}."""
+    global _bg_worker
+    p = _resolve(path)
+    files = [str(f) for f in T.iter_media_files(p)]
+    if not files:
+        return {"ok": False, "error": f"Нет видео/аудио по пути: {p}"}
+    jid = uuid.uuid4().hex[:8]
+    _bg_jobs[jid] = {
+        "ok": True, "job_id": jid, "status": "queued", "progress": 0.0, "desc": "в очереди",
+        "files": files, "results": [], "cancel": False,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "opts": {"model": model or None, "line_per_segment": line_per_segment,
+                 "diarize": diarize, "num_speakers": int(num_speakers or 0)},
+    }
+    with _bg_lock:
+        if _bg_worker is None or not _bg_worker.is_alive():
+            _bg_worker = threading.Thread(target=_worker_loop, daemon=True, name="transcribe-jobs")
+            _bg_worker.start()
+    _bg_queue.put(jid)
+    return _public(_bg_jobs[jid])
+
+
+def job_status(job_id: str) -> dict:
+    job = _bg_jobs.get(job_id)
+    return _public(job) if job else {"ok": False, "error": f"Нет задачи {job_id}"}
+
+
+def cancel_job(job_id: str) -> dict:
+    """Остановить задачу: текущий файл сохранится частично, остальные пропустятся."""
+    job = _bg_jobs.get(job_id)
+    if not job:
+        return {"ok": False, "error": f"Нет задачи {job_id}"}
+    job["cancel"] = True
+    return _public(job)
+
+
+def list_jobs() -> list[dict]:
+    return [_public(j) for j in sorted(_bg_jobs.values(), key=lambda j: j["created"], reverse=True)]
 
 
 # ──────────────────────────────────────────────
@@ -231,6 +429,7 @@ def list_transcripts() -> list[dict]:
             "segments": meta.get("segments"),
             "partial": bool(meta.get("partial")),
             "covered": meta.get("covered"),
+            "speakers": meta.get("speakers") or [],
         })
     return out
 
@@ -269,12 +468,28 @@ def api_set_enabled_models(names: list[str]) -> dict:
     return set_enabled_models(names)
 
 
-def api_transcribe(path: str, model: str = "", line_per_segment: bool = False) -> list[dict]:
+def api_transcribe(path: str, model: str = "", line_per_segment: bool = False,
+                   diarize: bool = False, num_speakers: int = 0) -> list[dict]:
     """
     Расшифровать файл или папку. Путь — внутри контейнера (/app/input/...)
     или относительный к папке input. Один файл = один результат.
     """
-    return transcribe_path(path, model or None, line_per_segment)
+    return transcribe_path(path, model or None, line_per_segment,
+                           diarize=diarize, num_speakers=num_speakers)
+
+
+def api_start_transcribe(path: str, model: str = "", line_per_segment: bool = True,
+                         diarize: bool = False, num_speakers: int = 0) -> dict:
+    return start_job(path, model or None, line_per_segment, diarize, num_speakers)
+
+
+def api_get_terms() -> dict:
+    return {"ok": True, "terms": T.get_terms()}
+
+
+def api_set_terms(terms: list[str]) -> dict:
+    ok, msg = T.set_terms(terms)
+    return {"ok": ok, "message": msg, "terms": T.get_terms()}
 
 
 def api_list_transcripts() -> list[dict]:
@@ -289,4 +504,5 @@ def api_read_transcript(name: str) -> dict:
 
 def api_runtime() -> dict:
     """Среда выполнения: device (cuda/cpu), compute_type, gpu_name, cpu_threads, beam_size."""
-    return T.runtime_info()
+    import diarizer as D
+    return {**T.runtime_info(), "diarization": D.runtime_info()}
