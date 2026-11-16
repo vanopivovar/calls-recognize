@@ -44,18 +44,6 @@
   автоопределение языка, VAD-фильтр тишины, реальный прогресс, кнопки «Стоп».
 - Экспорт: сплошной текст или «каждая реплика с новой строки».
 
-## Запуск через Docker
-
-```bash
-docker compose up -d --build
-```
-
-Откройте <http://localhost:7861>.
-
-- `input/` — сюда кладите записи для расшифровки папкой/файлом.
-- `output/` — сюда сохраняются результаты.
-- Модели кешируются в томе `whisper_cache` (качаются один раз).
-
 ## Подготовка к сборке образа
 
 Образ ставит библиотеки CUDA и сборку sherpa-onnx с поддержкой GPU из локальной
@@ -78,6 +66,20 @@ pip download nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70 \
 
 Без NVIDIA GPU эти шаги из `Dockerfile` можно убрать: Whisper сам перейдёт на
 CPU, а для разметки говорящих задайте `DIARIZATION_PROVIDER=cpu`.
+
+## Запуск через Docker
+
+Сначала наполните папку `wheels/` (раздел выше), затем:
+
+```bash
+docker compose up -d --build
+```
+
+Откройте <http://localhost:7861>.
+
+- `input/` — сюда кладите записи для расшифровки папкой/файлом.
+- `output/` — сюда сохраняются результаты.
+- Модели кешируются в томе `whisper_cache` (качаются один раз).
 
 ## Ускорение на GPU
 
@@ -123,12 +125,19 @@ python app.py
 
 Нужен установленный `ffmpeg`. Откройте <http://localhost:7861>.
 
+Разметка говорящих по умолчанию рассчитана на сборку sherpa-onnx с CUDA. С обычной
+установкой из `requirements.txt` задайте `DIARIZATION_PROVIDER=cpu`, иначе
+разметка завершится ошибкой (текст расшифровки при этом сохранится).
+
 ## Настройки (переменные окружения)
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
 | `WHISPER_MODEL` | `large-v3-turbo` в Docker, `small` без переменной | модель по умолчанию |
-| `WHISPER_COMPUTE_TYPE` | `int8` | `int8` (быстро) / `int8_float16` / `float32` |
+| `WHISPER_DEVICE` | `auto` | `auto` (GPU при наличии CUDA, иначе CPU) / `cuda` / `cpu` |
+| `WHISPER_COMPUTE_TYPE` | пусто | пусто = `float16` на GPU и `int8` на CPU; иначе `float16` / `int8_float16` / `int8` / `float32` |
+| `WHISPER_BEAM_SIZE` | `5` | ширина поиска: `5` точнее, `1`–`2` быстрее |
+| `WHISPER_CPU_THREADS` | пусто | потоки CPU в режиме без GPU; пусто = все ядра |
 | `WHISPER_LANGUAGE` | `ru` | `ru` или `auto` |
 | `WHISPER_DOWNLOAD_ROOT` | — | куда качать модели |
 | `INPUT_DIR` | `input` | папка с записями |

@@ -1,6 +1,6 @@
 services:
   calls-recognize:
-    image: calls-recognize:diarization-titanet-20261116
+    image: calls-recognize:latest
     build: .
     container_name: calls-recognize
     ports:

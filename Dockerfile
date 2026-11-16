@@ -21,13 +21,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# CUDA-библиотеки для GPU-режима (CTranslate2 нужны cuBLAS и cuDNN 9).
-# Wheels скачиваются на хосте в wheels/ (через прокси Docker Desktop большие
-# файлы с PyPI приходят битыми) и ставятся из локальной папки:
-#   py -m pip download nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70 \
-#      nvidia-nvjitlink-cu12==12.4.127 --only-binary=:all: --python-version 3.11 \
-#      --implementation cp --platform manylinux2014_x86_64 -d wheels
-# Драйвер приходит с хоста через --gpus all. Без GPU не мешают — откат на CPU.
+# Библиотеки CUDA и сборка sherpa-onnx с поддержкой GPU ставятся из локальной
+# папки wheels/ (в git не входит): пять пакетов NVIDIA с PyPI и wheel sherpa-onnx
+# для CUDA 12 / cuDNN 9. Как её наполнить — раздел «Подготовка к сборке образа»
+# в README. Драйвер приходит с хоста через проброс GPU в контейнер.
 COPY wheels/ /tmp/wheels/
 RUN pip install --no-cache-dir --no-index --find-links /tmp/wheels \
     nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70 \
