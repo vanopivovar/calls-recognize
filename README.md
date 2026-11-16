@@ -56,6 +56,29 @@ docker compose up -d --build
 - `output/` — сюда сохраняются результаты.
 - Модели кешируются в томе `whisper_cache` (качаются один раз).
 
+## Подготовка к сборке образа
+
+Образ ставит библиотеки CUDA и сборку sherpa-onnx с поддержкой GPU из локальной
+папки `wheels/` (в git она не входит, около 1,5 ГБ). Перед первой сборкой
+положите в неё шесть файлов для Python 3.11, Linux x86_64.
+
+Пять библиотек NVIDIA — с PyPI:
+
+```bash
+pip download nvidia-cublas-cu12==12.4.5.8 nvidia-cudnn-cu12==9.1.0.70 \
+  nvidia-nvjitlink-cu12==12.4.127 nvidia-curand-cu12==10.3.5.147 \
+  nvidia-cuda-runtime-cu12==12.8.90 --no-deps --only-binary=:all: \
+  --python-version 3.11 --implementation cp \
+  --platform manylinux2014_x86_64 -d wheels
+```
+
+Сборка sherpa-onnx с CUDA — со страницы
+<https://k2-fsa.github.io/sherpa/onnx/cuda.html>, файл
+`sherpa_onnx-1.13.8+cuda12.cudnn9.onnxruntime1.28.2-cp311-cp311-linux_x86_64.whl`.
+
+Без NVIDIA GPU эти шаги из `Dockerfile` можно убрать: Whisper сам перейдёт на
+CPU, а для разметки говорящих задайте `DIARIZATION_PROVIDER=cpu`.
+
 ## Ускорение на GPU
 
 Сервис сам использует NVIDIA GPU, если она проброшена в контейнер

@@ -22,6 +22,14 @@ wheels/
 # Локальные копии файлов перед правками
 backups/
 
+# Локальные настройки и секреты (токен Hugging Face)
+.env
+.env.*
+!.env.example
+
+# Логи
+*.log
+
 # OS
 .DS_Store
 Thumbs.db
